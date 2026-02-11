@@ -1,3 +1,4 @@
+st.image("logo.png", width=180)
 import os
 import re
 from datetime import datetime
@@ -275,3 +276,4 @@ with out_col:
         )
 
     st.markdown("</div>", unsafe_allow_html=True)
+
