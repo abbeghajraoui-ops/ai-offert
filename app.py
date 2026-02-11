@@ -276,4 +276,6 @@ with out_col:
         )
 
     st.markdown("</div>", unsafe_allow_html=True)
+Add logo to app
+
 
