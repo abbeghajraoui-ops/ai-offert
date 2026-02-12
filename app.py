@@ -281,7 +281,14 @@ api_key = get_api_key()
 
 with st.sidebar:
     st.markdown(f"## {APP_NAME}")
-    st.caption("Skapa en offert på sekunder.")
+    st.caption("Automatisera offerter och vinn fler affärer.")
+st.markdown("#### Varför Offertly?")
+st.markdown("""
+- ⏱ Skapa offert på under 1 minut  
+- 📄 Snygg PDF direkt till kund  
+- 💰 Tydlig prisuppdelning  
+- 🧠 AI-text som låter professionell  
+""")
 
     # Om du har en app-logga i projektmappen (t.ex. logo.png)
     if os.path.exists("logo.png"):
@@ -514,6 +521,7 @@ with out_col:
         )
 
     st.markdown("</div>", unsafe_allow_html=True)
+
 
 
 
