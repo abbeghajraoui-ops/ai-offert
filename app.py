@@ -11,7 +11,7 @@ import streamlit as st
 try:
     from openai import OpenAI
 except Exception:
-    OpenAI = None  # hanteras i UI
+    OpenAI = None
 
 # PDF (ReportLab)
 from reportlab.lib.pagesizes import A4
@@ -21,11 +21,11 @@ from reportlab.lib.utils import ImageReader
 
 
 # =============================
-# Konfiguration / Branding
+# Branding / copy (B2B)
 # =============================
 APP_NAME = "Offertly"
-APP_TITLE = "Offertly – offertmotor för byggbolag"
-APP_TAGLINE = "Skapa professionella offerter på under 60 sekunder."
+APP_TITLE = "Offertly – offertmotor för byggbranschen"
+APP_TAGLINE = "För företag som säljer tjänster till byggbolag. Skapa professionella offerter på under 60 sekunder."
 
 
 # =============================
@@ -40,7 +40,7 @@ def safe_filename(s: str) -> str:
 
 def get_api_key() -> Optional[str]:
     """
-    Försöker läsa OPENAI_API_KEY från:
+    Läser OPENAI_API_KEY från:
       1) Streamlit Secrets (utan att krascha om secrets saknas)
       2) Miljövariabel
     """
@@ -65,13 +65,13 @@ Du är en professionell offertskrivare för byggrelaterade tjänster (B2B). Skri
 
 Skapa en tydlig och proffsig offert baserat på:
 
-Företag: {d['company']}
+Företag (utförare): {d['company']}
 Kontakt: {d['contact']}
 Datum: {d['date']}
-Kund: {d['customer']}
+Beställare: {d['customer']}
 Plats/ort: {d['location']}
 
-Typ av arbete/tjänst: {d['job_type']}
+Tjänst: {d['job_type']}
 Omfattning/storlek: {d['size']}
 Material: {d['material']}
 Kommentar/önskemål: {d['comment']}
@@ -93,30 +93,17 @@ Krav:
 - Avsluta med vänlig hälsning + kontakt
 
 Skriv kortfattat, tydligt och professionellt.
-"""
-
-
-def draw_wrapped_text(c: canvas.Canvas, text: str, x: float, y: float, max_chars: int, line_h: float):
-    for raw in (text or "").splitlines():
-        line = raw.replace("\t", "    ")
-        if not line.strip():
-            y -= line_h
-            continue
-
-        while len(line) > max_chars:
-            c.drawString(x, y, line[:max_chars])
-            y -= line_h
-            line = line[max_chars:]
-        c.drawString(x, y, line)
-        y -= line_h
-    return y
+""".strip()
 
 
 def generate_pdf_premium(
-    offer_md: str,
+    offer_text: str,
     data: dict,
     customer_logo_bytes: Optional[bytes] = None,
 ) -> bytes:
+    """
+    Premium PDF: header, metadata, kundlogo (om uppladdad), prisruta och offerttext.
+    """
     buf = BytesIO()
     c = canvas.Canvas(buf, pagesize=A4)
     width, height = A4
@@ -124,12 +111,19 @@ def generate_pdf_premium(
     margin = 18 * mm
     x = margin
     y = height - margin
+    line_h = 5.2 * mm
+
+    def new_page():
+        nonlocal y
+        c.showPage()
+        y = height - margin
+        c.setFont("Helvetica", 10)
 
     # Header
     c.setFont("Helvetica-Bold", 16)
     c.drawString(x, y, "OFFERT")
     c.setFont("Helvetica", 10)
-    c.drawRightString(width - margin, y, f"{APP_NAME}")
+    c.drawRightString(width - margin, y, APP_NAME)
     y -= 10 * mm
 
     # Kundens logga (uppladdad)
@@ -145,33 +139,35 @@ def generate_pdf_premium(
                 logo_w,
                 logo_h,
                 mask="auto",
+                preserveAspectRatio=True,
+                anchor="c",
             )
         except Exception:
             pass
 
-    # Meta
+    # Meta-rad
     c.setFont("Helvetica", 10)
     c.drawString(x, y, f"Offert-ID: {data.get('offer_id','')}")
     c.drawRightString(width - margin, y, f"Datum: {data.get('date','')}")
     y -= 8 * mm
 
-    # Företag
+    # Företagsblock
     c.setFont("Helvetica-Bold", 11)
     c.drawString(x, y, data.get("company", ""))
     y -= 5.5 * mm
     c.setFont("Helvetica", 10)
-    y = draw_wrapped_text(c, f"Kontakt: {data.get('contact','')}", x, y, 95, 5.2 * mm)
-    y -= 2 * mm
+    c.drawString(x, y, f"Kontakt: {data.get('contact','')}")
+    y -= 8 * mm
 
-    # Kund
+    # Kundblock
     c.setFont("Helvetica-Bold", 11)
-    c.drawString(x, y, f"Kund: {data.get('customer','')}")
+    c.drawString(x, y, f"Beställare: {data.get('customer','')}")
     y -= 5.5 * mm
     c.setFont("Helvetica", 10)
     c.drawString(x, y, f"Plats/ort: {data.get('location','')}")
     y -= 8 * mm
 
-    # Tjänst
+    # Tjänstinfo
     c.setFont("Helvetica-Bold", 11)
     c.drawString(x, y, f"Tjänst: {data.get('job_type','')}")
     y -= 5.5 * mm
@@ -197,36 +193,33 @@ def generate_pdf_premium(
     c.drawRightString(x + box_w - 6 * mm, y, f"Total: {data.get('price_total','')}")
     y -= 12 * mm
 
-    # Offerttext
+    # Offerttext (skrivs som text, enkel formatting)
     c.setFont("Helvetica-Bold", 12)
     c.drawString(x, y, "Offerttext")
     y -= 7 * mm
     c.setFont("Helvetica", 10)
-    line_h = 5.2 * mm
 
-    def new_page():
-        nonlocal y
-        c.showPage()
-        y = height - margin
-        c.setFont("Helvetica", 10)
+    for raw in (offer_text or "").splitlines():
+        line = raw.replace("\t", "    ").rstrip()
 
-    for raw in (offer_md or "").splitlines():
-        line = raw.replace("\t", "    ").strip()
-
-        if line.startswith("#"):
-            line = line.lstrip("#").strip()
+        # lite enklare rubriker
+        stripped = line.strip()
+        if stripped.startswith("#"):
+            title = stripped.lstrip("#").strip()
             y -= 2 * mm
             c.setFont("Helvetica-Bold", 11)
-            c.drawString(x, y, line)
+            c.drawString(x, y, title)
             c.setFont("Helvetica", 10)
             y -= 6 * mm
             if y < margin:
                 new_page()
             continue
 
-        if line.startswith(("-", "•")):
-            line = "• " + line.lstrip("-• ").strip()
+        # bullets
+        if stripped.startswith(("-", "•")):
+            line = "• " + stripped.lstrip("-• ").strip()
 
+        # wrap
         while len(line) > 110:
             c.drawString(x, y, line[:110])
             y -= line_h
@@ -242,6 +235,50 @@ def generate_pdf_premium(
     c.save()
     buf.seek(0)
     return buf.read()
+
+
+def fallback_offer(d: dict) -> str:
+    return f"""# Offert för {d['job_type']}
+
+**Offert-ID:** {d['offer_id']}  
+**Datum:** {d['date']}  
+**Företag:** {d['company']}  
+**Kontakt:** {d['contact']}  
+**Beställare:** {d['customer']}  
+**Plats/ort:** {d['location']}
+
+## Projektbeskrivning
+Vi lämnar härmed offert för {d['job_type']} enligt angivna uppgifter.
+
+## Arbetsmoment
+- Genomgång och planering
+- Utförande enligt överenskommelse
+- Avstämning och slutkontroll
+
+## Material
+- {d['material']}
+
+## Tidsplan
+Startdatum: enligt överenskommelse. Leverans: 2–6 veckor beroende på omfattning.
+
+## Pris
+- Arbete: {d['price_work']} SEK  
+- Material: {d['price_material']} SEK  
+- Övrigt: {d['price_other']} SEK  
+**Totalpris inkl. moms:** {d['price_total']} SEK
+
+## Villkor
+1. Offerten gäller i 30 dagar.
+2. Betalningsvillkor: 30 dagar.
+3. Tilläggsarbete debiteras enligt överenskommelse.
+4. Startdatum enligt överenskommelse.
+
+## Kontakt
+{d['company']} – {d['contact']}
+
+Vänliga hälsningar,  
+{d['company']}
+"""
 
 
 # =============================
@@ -273,44 +310,7 @@ api_key = get_api_key()
 
 # Session state
 if "offertext" not in st.session_state:
-    st.session_state.offertext = """
-## Offert för Altanbygge
-
-**Företag:** Demo Bygg AB  
-**Datum:** 2026-02-12  
-**Kund:** Anders Svensson  
-**Plats/ort:** Malmö  
-
-### Projektbeskrivning
-Byggnation av altan på cirka 25 kvm i tryckimpregnerat trä.
-
-### Arbetsmoment
-- Markarbete och förberedelse
-- Montering av bärlina och stomme
-- Läggning av altanbrädor
-- Räcke och trappsteg
-- Slutstädning
-
-### Material
-- Tryckimpregnerat virke
-- Skruv och beslag
-- Plintar och bärlinor
-
-### Tidsplan
-Arbetet beräknas ta cirka 5 arbetsdagar.
-
-### Pris
-- Arbete: 38 000 kr
-- Material: 22 000 kr
-- Övrigt: 3 000 kr  
-**Totalpris inkl. moms: 63 000 kr**
-
-### Villkor
-- Offerten giltig i 30 dagar
-- Betalning: 30% vid start, resterande efter slutfört arbete
-- Eventuella tillägg debiteras separat
-- Start enligt överenskommelse
-"""
+    st.session_state.offertext = ""  # <-- ingen demo-text
 if "meta" not in st.session_state:
     st.session_state.meta = {}
 if "offer_id" not in st.session_state:
@@ -321,6 +321,7 @@ with st.sidebar:
     st.markdown(f"## {APP_NAME}")
     st.caption("Automatisera offerter och vinn fler affärer.")
 
+    # Din app-logga (Offertly) om du har logo.png i repo/mapp
     if os.path.exists("logo.png"):
         st.image("logo.png", use_container_width=True)
 
@@ -334,18 +335,19 @@ with st.sidebar:
         st.caption('Lägg nyckeln i Streamlit Secrets som:\n\nOPENAI_API_KEY = "sk-..."')
 
     st.divider()
-    st.markdown("### Kundens logo (valfritt)")
-    st.caption("Ladda upp logo för PDF (PNG/JPG)")
+    st.markdown("### Kundföretagets logga (valfritt)")
+    st.caption("Loggan som syns i PDF (PNG/JPG)")
     customer_logo_file = st.file_uploader(" ", type=["png", "jpg", "jpeg"], label_visibility="collapsed")
 
     st.divider()
     st.markdown("### Tips")
-    st.caption("Det är kundens logo som ska synas i PDF-offerten.")
+    st.caption("Det är kundföretagets logga som ska synas i PDF-offerten.")
+
 
 # Header
 st.markdown(f"# {APP_TITLE}")
 st.markdown(f'<div class="muted">{APP_TAGLINE}</div>', unsafe_allow_html=True)
-st.write("")
+
 st.markdown("#### Varför Offertly?")
 st.markdown(
     """
@@ -357,6 +359,7 @@ st.markdown(
 )
 
 st.write("")
+
 form_col, out_col = st.columns([1.05, 1.25], gap="large")
 
 # Form
@@ -366,14 +369,14 @@ with form_col:
 
     c1, c2 = st.columns(2)
     with c1:
-        company = st.text_input("Företagsnamn", value="")
+        company = st.text_input("Företagsnamn (utförare)", value="")
         contact = st.text_input("Kontaktinfo (tel/mejl)", value="")
     with c2:
         date_str = st.date_input("Datum", value=datetime.now()).strftime("%Y-%m-%d")
         location = st.text_input("Plats/ort", value="")
 
-    customer = st.text_input("Kundens namn", value="")
-    job_type = st.text_input("Typ av jobb", value="")
+    customer = st.text_input("Beställare / kundens namn", value="")
+    job_type = st.text_input("Tjänst / typ av jobb", value="")
     size = st.text_input("Omfattning / storlek", value="")
     material = st.text_input("Material", value="")
 
@@ -405,9 +408,9 @@ if gen:
     for val, label in [
         (company, "Företagsnamn"),
         (contact, "Kontaktinfo"),
-        (customer, "Kundens namn"),
+        (customer, "Beställare / kundens namn"),
         (location, "Plats/ort"),
-        (job_type, "Typ av jobb"),
+        (job_type, "Tjänst / typ av jobb"),
         (size, "Omfattning / storlek"),
     ]:
         if not str(val).strip():
@@ -416,9 +419,6 @@ if gen:
     if missing:
         st.error("Fyll i: " + ", ".join(missing))
     else:
-        # ny offert-id per generering
-        st.session_state.offer_id = generate_offer_id()
-
         d = {
             "company": company.strip(),
             "contact": contact.strip(),
@@ -433,52 +433,12 @@ if gen:
             "price_work": int(price_work),
             "price_material": int(price_material),
             "price_other": int(price_other),
-            "price_total": total_price,
+            "price_total": int(total_price),
         }
 
-        # fallback om ingen nyckel / ingen OpenAI
+        # Kör AI om möjligt, annars fallback
         if (not api_key) or (OpenAI is None):
-            st.session_state.offertext = f"""# Offert för {d['job_type']}
-
-**Offert-ID:** {d['offer_id']}  
-**Datum:** {d['date']}  
-**Företag:** {d['company']}  
-**Kontakt:** {d['contact']}  
-**Kund:** {d['customer']}  
-**Plats/ort:** {d['location']}
-
-## Projektbeskrivning
-Vi lämnar härmed offert för {d['job_type']} enligt angivna uppgifter.
-
-## Arbetsmoment
-- Genomgång och planering
-- Utförande enligt överenskommelse
-- Avstämning och slutbesiktning
-
-## Material
-- Enligt överenskommelse: {d['material']}
-
-## Tidsplan
-Startdatum: enligt överenskommelse. Leverans: 2–6 veckor beroende på omfattning.
-
-## Pris
-- Arbete: {d['price_work']} SEK  
-- Material: {d['price_material']} SEK  
-- Övrigt: {d['price_other']} SEK  
-**Totalpris inkl. moms:** {d['price_total']} SEK
-
-## Villkor
-1. Offerten gäller i 30 dagar.
-2. Betalningsvillkor: 30 dagar.
-3. Tilläggsarbete debiteras enligt överenskommelse.
-4. Startdatum enligt överenskommelse.
-
-## Kontakt
-{d['company']} – {d['contact']}
-
-Vänliga hälsningar,  
-{d['company']}
-"""
+            st.session_state.offertext = fallback_offer(d)
         else:
             client = OpenAI(api_key=api_key)
             prompt = build_prompt(d)
@@ -487,7 +447,10 @@ Vänliga hälsningar,
                     resp = client.chat.completions.create(
                         model="gpt-4o-mini",
                         messages=[
-                            {"role": "system", "content": "Du skriver professionella svenska offerter för byggrelaterade tjänster (B2B)."},
+                            {
+                                "role": "system",
+                                "content": "Du skriver professionella svenska offerter för byggrelaterade tjänster (B2B).",
+                            },
                             {"role": "user", "content": prompt},
                         ],
                         temperature=0.3,
@@ -506,7 +469,7 @@ with out_col:
     st.subheader("Färdig offert")
 
     if not st.session_state.offertext:
-        st.info("Generera en offert så dyker den upp här.")
+        st.info("Fyll i projektdata och klicka 'Generera offert' så dyker den upp här.")
     else:
         offertext = st.session_state.offertext
         st.markdown(offertext)
@@ -516,34 +479,32 @@ with out_col:
 
         meta = st.session_state.meta or {}
         fname_base = f"offert_{safe_filename(meta.get('jobb','jobb'))}_{safe_filename(meta.get('kund','kund'))}_{meta.get('datum','')}"
+
         customer_logo_bytes = customer_logo_file.read() if customer_logo_file else None
 
-        # Använd formulärdata om finns, annars tomt (så demo inte kraschar)
-        pdf_data = {
-            "company": (company or "").strip(),
-            "contact": (contact or "").strip(),
-            "customer": (customer or "").strip(),
-            "location": (location or "").strip(),
-            "job_type": (job_type or "").strip(),
-            "size": (size or "").strip(),
-            "material": (material or "").strip(),
-            "date": date_str,
-            "offer_id": st.session_state.offer_id,
-            "price_work": int(price_work),
-            "price_material": int(price_material),
-            "price_other": int(price_other),
-            "price_total": int(total_price),
-        }
-
-        pdf_buffer = generate_pdf_premium(
-            offer_md=offertext,
-            data=pdf_data,
+        pdf_bytes = generate_pdf_premium(
+            offer_text=offertext,
+            data={
+                "company": company.strip(),
+                "contact": contact.strip(),
+                "customer": customer.strip(),
+                "location": location.strip(),
+                "job_type": job_type.strip(),
+                "size": size.strip(),
+                "material": material.strip(),
+                "date": date_str,
+                "offer_id": st.session_state.offer_id,
+                "price_work": int(price_work),
+                "price_material": int(price_material),
+                "price_other": int(price_other),
+                "price_total": int(total_price),
+            },
             customer_logo_bytes=customer_logo_bytes,
         )
 
         st.download_button(
             "📄 Ladda ner premium-PDF",
-            data=pdf_buffer,
+            data=pdf_bytes,
             file_name=f"{fname_base}_premium.pdf",
             mime="application/pdf",
             use_container_width=True,
@@ -557,7 +518,17 @@ with out_col:
             use_container_width=True,
         )
 
+        st.download_button(
+            "⬇️ Ladda ner som .txt",
+            data=offertext,
+            file_name=f"{fname_base}.txt",
+            mime="text/plain; charset=utf-8",
+            use_container_width=True,
+        )
+
     st.markdown("</div>", unsafe_allow_html=True)
+
+
 
 
 
