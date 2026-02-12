@@ -322,8 +322,46 @@ if "offertext" not in st.session_state:
     st.session_state.offertext = ""
 if "meta" not in st.session_state:
     st.session_state.meta = {}
-if "offer_id" not in st.session_state:
-    st.session_state.offer_id = generate_offer_id()
+if "offertext" not in st.session_state:
+    st.session_state.offertext = """
+## Offert för Altanbygge
+
+**Företag:** Demo Bygg AB  
+**Datum:** 2026-02-12  
+**Kund:** Anders Svensson  
+**Plats/ort:** Malmö  
+
+### Projektbeskrivning
+Byggnation av altan på cirka 25 kvm i tryckimpregnerat trä.
+
+### Arbetsmoment
+- Markarbete och förberedelse
+- Montering av bärlina och stomme
+- Läggning av altanbrädor
+- Räcke och trappsteg
+- Slutstädning
+
+### Material
+- Tryckimpregnerat virke
+- Skruv och beslag
+- Plintar och bärlinor
+
+### Tidsplan
+Arbetet beräknas ta cirka 5 arbetsdagar.
+
+### Pris
+- Arbete: 38 000 kr
+- Material: 22 000 kr
+- Övrigt: 3 000 kr  
+**Totalpris inkl. moms: 63 000 kr**
+
+### Villkor
+- Offerten giltig i 30 dagar
+- Betalning: 30% vid start, resterande efter slutfört arbete
+- Eventuella tillägg debiteras separat
+- Start enligt överenskommelse
+"""
+
 
 form_col, out_col = st.columns([1.05, 1.25], gap="large")
 
@@ -521,6 +559,7 @@ with out_col:
         )
 
     st.markdown("</div>", unsafe_allow_html=True)
+
 
 
 
