@@ -319,10 +319,6 @@ st.write("")
 
 # session state
 if "offertext" not in st.session_state:
-    st.session_state.offertext = ""
-if "meta" not in st.session_state:
-    st.session_state.meta = {}
-if "offertext" not in st.session_state:
     st.session_state.offertext = """
 ## Offert för Altanbygge
 
@@ -361,6 +357,9 @@ Arbetet beräknas ta cirka 5 arbetsdagar.
 - Eventuella tillägg debiteras separat
 - Start enligt överenskommelse
 """
+
+if "meta" not in st.session_state:
+    st.session_state.meta = {}
 
 
 form_col, out_col = st.columns([1.05, 1.25], gap="large")
@@ -559,6 +558,7 @@ with out_col:
         )
 
     st.markdown("</div>", unsafe_allow_html=True)
+
 
 
 
