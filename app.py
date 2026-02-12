@@ -3,7 +3,7 @@ import re
 import uuid
 from datetime import datetime
 from io import BytesIO
-from typing import Optional
+from typing import Optional, Dict, Any
 
 import streamlit as st
 
@@ -25,7 +25,73 @@ from reportlab.lib.utils import ImageReader
 # =============================
 APP_NAME = "Offertly"
 APP_TITLE = "Offertly – offertmotor för bygg & VVS"
-APP_TAGLINE = "För byggföretag och VVS-firmor som skickar offerter till privatkunder. Skapa en proffsig offert på under 60 sekunder."
+APP_TAGLINE = "För byggfirmor och VVS-firmor som skickar offerter till privatkunder. Skapa en proffsig offert på under 60 sekunder."
+
+
+# =============================
+# Demo-offert (Start-sidan)
+# =============================
+DEMO_DATA = {
+    "company": "Demo Bygg & VVS AB",
+    "contact": "070-123 45 67 • info@demobyggvvs.se",
+    "customer": "Anders Svensson",
+    "location": "Malmö",
+    "job_type": "Altanbygge",
+    "size": "25 kvm",
+    "material": "Tryckimpregnerat virke",
+    "date": "2026-02-12",
+    "offer_id": "OFF-DEMO01",
+    "price_work": 38000,
+    "price_material": 22000,
+    "price_other": 3000,
+    "price_total": 63000,
+}
+
+DEMO_OFFER_MD = """# Offert för Altanbygge
+
+**Offert-ID:** OFF-DEMO01  
+**Datum:** 2026-02-12  
+**Företag:** Demo Bygg & VVS AB  
+**Kontakt:** 070-123 45 67 • info@demobyggvvs.se  
+**Kund:** Anders Svensson  
+**Plats/ort:** Malmö  
+
+## Projektbeskrivning
+Byggnation av altan på cirka 25 kvm i tryckimpregnerat trä.
+
+## Arbetsmoment
+- Markarbete och förberedelse
+- Montering av bärlina och stomme
+- Läggning av altanbrädor
+- Räcke och trappsteg
+- Slutstädning
+
+## Material
+- Tryckimpregnerat virke
+- Skruv och beslag
+- Plintar och bärlinor
+
+## Tidsplan
+Arbetet beräknas ta cirka 5 arbetsdagar.
+
+## Pris
+- Arbete: 38 000 kr
+- Material: 22 000 kr
+- Övrigt: 3 000 kr  
+**Totalpris inkl. moms: 63 000 kr**
+
+## Villkor
+1. Offerten gäller i 30 dagar.
+2. Betalningsvillkor: 30 dagar.
+3. Tilläggsarbete debiteras enligt överenskommelse.
+4. Startdatum enligt överenskommelse.
+
+## Kontakt
+Demo Bygg & VVS AB – 070-123 45 67 • info@demobyggvvs.se
+
+Vänliga hälsningar,  
+Demo Bygg & VVS AB
+"""
 
 
 # =============================
@@ -45,7 +111,7 @@ def get_api_key() -> Optional[str]:
       2) Miljövariabel
     """
     try:
-        if hasattr(st, "secrets") and "OPENAI_API_KEY" in st.secrets:
+        if "OPENAI_API_KEY" in st.secrets:
             v = str(st.secrets["OPENAI_API_KEY"]).strip()
             return v or None
     except Exception:
@@ -59,19 +125,19 @@ def generate_offer_id() -> str:
     return "OFF-" + uuid.uuid4().hex[:8].upper()
 
 
-def build_prompt(d: dict) -> str:
+def build_prompt(d: Dict[str, Any]) -> str:
     return f"""
-Du är en professionell offertskrivare för byggföretag och VVS-firmor som lämnar offerter till privatkunder. Skriv på svenska.
+Du är en professionell offertskrivare för bygg- och VVS-arbeten som skickas till privatkunder. Skriv på svenska.
 
-Skapa en tydlig, proffsig och lättläst offert baserat på:
+Skapa en tydlig och proffsig offert baserat på:
 
-Företag (utförare): {d['company']}
+Företag: {d['company']}
 Kontakt: {d['contact']}
 Datum: {d['date']}
-Beställare/kund: {d['customer']}
+Kund: {d['customer']}
 Plats/ort: {d['location']}
 
-Tjänst/arbete: {d['job_type']}
+Typ av arbete/tjänst: {d['job_type']}
 Omfattning/storlek: {d['size']}
 Material: {d['material']}
 Kommentar/önskemål: {d['comment']}
@@ -84,19 +150,19 @@ Prisuppgifter (använd dessa exakt):
 
 Krav:
 - Använd rubriker: Projektbeskrivning, Arbetsmoment, Material, Tidsplan, Pris, Villkor, Kontakt
-- Arbetsmoment: punktlista (5–10 punkter)
+- Arbetsmoment: punktlista
 - Materiallista: punktlista
-- Tidsplan: realistisk (ex: dagar/veckor) och start “enl. överenskommelse”
-- Pris: visa uppdelning + total inkl moms (med SEK)
-- 5–7 korta villkor (giltighetstid, betalning, tillägg/ÄTA, ROT om relevant, garanti, startdatum)
-- Datum ska vara exakt: {d['date']} (skriv inte “[Dagens datum]”)
-- Avsluta med vänlig hälsning + företagets kontakt
+- Tidsplan: realistisk (veckor/dagar)
+- Pris: visa uppdelning + total inkl moms
+- 4–6 korta villkor (giltighetstid, betalning, tillägg, startdatum “enl. överenskommelse”, ROT om relevant)
+- Datum ska vara exakt: {d['date']} (skriv inte "[Dagens datum]")
+- Avsluta med vänlig hälsning + kontakt
 
-Skriv kortfattat, tydligt och professionellt. Undvik överdrivet marknadsföringsspråk.
+Skriv kortfattat, tydligt och professionellt.
 """
 
 
-def draw_wrapped_text(c: canvas.Canvas, text: str, x: float, y: float, max_chars: int, line_h: float):
+def draw_wrapped_text(c: canvas.Canvas, text: str, x: float, y: float, max_chars: int, line_h: float) -> float:
     for raw in (text or "").splitlines():
         line = raw.replace("\t", "    ")
         if not line.strip():
@@ -114,7 +180,7 @@ def draw_wrapped_text(c: canvas.Canvas, text: str, x: float, y: float, max_chars
 
 def generate_pdf_premium(
     offer_md: str,
-    data: dict,
+    data: Dict[str, Any],
     customer_logo_bytes: Optional[bytes] = None,
 ) -> bytes:
     buf = BytesIO()
@@ -129,15 +195,15 @@ def generate_pdf_premium(
     c.setFont("Helvetica-Bold", 16)
     c.drawString(x, y, "OFFERT")
     c.setFont("Helvetica", 10)
-    c.drawRightString(width - margin, y, APP_NAME)
+    c.drawRightString(width - margin, y, f"{APP_NAME}")
     y -= 10 * mm
 
-    # Kundens logga (uppladdad)
+    # Kundens logga (uppladdad) uppe till höger
     if customer_logo_bytes:
         try:
             img = ImageReader(BytesIO(customer_logo_bytes))
-            logo_w = 42 * mm
-            logo_h = 24 * mm
+            logo_w = 38 * mm
+            logo_h = 22 * mm
             c.drawImage(
                 img,
                 width - margin - logo_w,
@@ -157,7 +223,7 @@ def generate_pdf_premium(
     c.drawRightString(width - margin, y, f"Datum: {data.get('date','')}")
     y -= 8 * mm
 
-    # Företag
+    # Företagsblock
     c.setFont("Helvetica-Bold", 11)
     c.drawString(x, y, data.get("company", ""))
     y -= 5.5 * mm
@@ -165,7 +231,7 @@ def generate_pdf_premium(
     y = draw_wrapped_text(c, f"Kontakt: {data.get('contact','')}", x, y, 95, 5.2 * mm)
     y -= 2 * mm
 
-    # Kund
+    # Kundblock
     c.setFont("Helvetica-Bold", 11)
     c.drawString(x, y, f"Kund: {data.get('customer','')}")
     y -= 5.5 * mm
@@ -192,11 +258,11 @@ def generate_pdf_premium(
     c.setFont("Helvetica", 10)
     c.drawRightString(x + box_w - 6 * mm, y, "SEK (inkl. moms)")
     y -= 6.5 * mm
-    c.drawString(x + 6 * mm, y, f"Arbete: {data.get('price_work','')} SEK")
-    c.drawRightString(x + box_w - 6 * mm, y, f"Material: {data.get('price_material','')} SEK")
+    c.drawString(x + 6 * mm, y, f"Arbete: {data.get('price_work','')}")
+    c.drawRightString(x + box_w - 6 * mm, y, f"Material: {data.get('price_material','')}")
     y -= 5.5 * mm
-    c.drawString(x + 6 * mm, y, f"Övrigt: {data.get('price_other','')} SEK")
-    c.drawRightString(x + box_w - 6 * mm, y, f"Total: {data.get('price_total','')} SEK")
+    c.drawString(x + 6 * mm, y, f"Övrigt: {data.get('price_other','')}")
+    c.drawRightString(x + box_w - 6 * mm, y, f"Total: {data.get('price_total','')}")
     y -= 12 * mm
 
     # Offerttext
@@ -214,14 +280,15 @@ def generate_pdf_premium(
         c.setFont("Helvetica", 10)
 
     for raw in (offer_md or "").splitlines():
-        line = raw.replace("\t", "    ").strip()
+        line = raw.replace("\t", "    ").rstrip()
 
-        # Rubriker i markdown
-        if line.startswith("#"):
-            line = line.lstrip("#").strip()
+        # Rubriker
+        stripped = line.strip()
+        if stripped.startswith("#"):
+            title = stripped.lstrip("#").strip()
             y -= 2 * mm
             c.setFont("Helvetica-Bold", 11)
-            c.drawString(x, y, line)
+            c.drawString(x, y, title)
             c.setFont("Helvetica", 10)
             y -= 6 * mm
             if y < margin:
@@ -229,8 +296,8 @@ def generate_pdf_premium(
             continue
 
         # bullets
-        if line.startswith(("-", "•")):
-            line = "• " + line.lstrip("-• ").strip()
+        if stripped.startswith(("-", "•")):
+            line = "• " + stripped.lstrip("-• ").strip()
 
         # wrap
         while len(line) > 110:
@@ -250,7 +317,7 @@ def generate_pdf_premium(
     return buf.read()
 
 
-def fallback_offer_text(d: dict) -> str:
+def fallback_offer_text(d: Dict[str, Any]) -> str:
     return f"""# Offert för {d['job_type']}
 
 **Offert-ID:** {d['offer_id']}  
@@ -261,19 +328,18 @@ def fallback_offer_text(d: dict) -> str:
 **Plats/ort:** {d['location']}
 
 ## Projektbeskrivning
-Vi lämnar härmed offert för **{d['job_type']}** enligt angivna uppgifter.
+Vi lämnar härmed offert för {d['job_type']} enligt angivna uppgifter.
 
 ## Arbetsmoment
-- Genomgång av förutsättningar på plats
-- Planering och materialbeställning
-- Utförande av arbetet enligt överenskommelse
-- Avstämning med kund och avslut
+- Genomgång och planering
+- Utförande enligt överenskommelse
+- Avstämning och slutbesiktning
 
 ## Material
-- {d['material']}
+- Enligt överenskommelse: {d['material']}
 
 ## Tidsplan
-Startdatum: enligt överenskommelse. Utförandetid: beror på omfattning (normalt 1–4 veckor).
+Startdatum: enligt överenskommelse. Leverans: 1–4 veckor beroende på omfattning.
 
 ## Pris
 - Arbete: {d['price_work']} SEK  
@@ -283,11 +349,10 @@ Startdatum: enligt överenskommelse. Utförandetid: beror på omfattning (normal
 
 ## Villkor
 1. Offerten gäller i 30 dagar.
-2. Betalningsvillkor: 10–30 dagar enligt överenskommelse.
-3. Eventuellt tilläggsarbete/ÄTA prissätts separat efter godkännande.
+2. Betalningsvillkor: 30 dagar.
+3. Tilläggsarbete debiteras enligt överenskommelse.
 4. Startdatum enligt överenskommelse.
-5. ROT-avdrag hanteras enligt gällande regler (om tillämpligt).
-6. Garanti enligt konsumenttjänstlagen och branschpraxis.
+5. ROT-avdrag hanteras enligt gällande regler om tillämpligt.
 
 ## Kontakt
 {d['company']} – {d['contact']}
@@ -318,20 +383,14 @@ st.markdown(
         padding: 0.65rem 1rem !important;
       }
       .pill {
-        display:inline-block;
+        display: inline-block;
         padding: 6px 10px;
+        border: 1px solid rgba(0,0,0,0.10);
         border-radius: 999px;
-        border: 1px solid rgba(0,0,0,0.08);
         margin-right: 8px;
         margin-bottom: 8px;
         font-size: 0.9rem;
-        background: rgba(255,255,255,0.65);
-      }
-      .pricecard {
-        border: 1px solid rgba(0,0,0,0.08);
-        border-radius: 16px;
-        padding: 14px;
-        background: rgba(255,255,255,0.75);
+        background: rgba(255,255,255,0.6);
       }
     </style>
     """,
@@ -353,7 +412,7 @@ with st.sidebar:
     st.markdown(f"## {APP_NAME}")
     st.caption("Automatisera offerter och vinn fler jobb.")
 
-    # Visa app-logga om den finns (valfritt)
+    # App-logga i projektmappen (valfritt)
     if os.path.exists("logo.png"):
         st.image("logo.png", use_container_width=True)
 
@@ -373,87 +432,124 @@ with st.sidebar:
 
     st.divider()
     st.markdown("### Tips")
-    st.caption("Använd kundens logga i PDF när du skickar offerten till privatkunden.")
+    st.caption("Om du får 401/invalid_api_key: kontrollera att nyckeln är korrekt och utan mellanslag.")
 
 
-# Header / säljcopy
-st.markdown(f"# {APP_TITLE}")
-st.markdown(f'<div class="muted">{APP_TAGLINE}</div>', unsafe_allow_html=True)
-st.write("")
+# Top navigation
+page = st.radio(
+    "Navigering",
+    ["🏠 Start", "🧾 Skapa offert"],
+    horizontal=True,
+    label_visibility="collapsed",
+)
+if "page" in st.session_state:
+    page = st.session_state.pop("page")
 
-st.markdown("#### Målgrupp")
-st.markdown(
-    """
+# =============================
+# START
+# =============================
+if page == "🏠 Start":
+    st.markdown(f"# {APP_TITLE}")
+    st.markdown(f'<div class="muted">{APP_TAGLINE}</div>', unsafe_allow_html=True)
+
+    st.write("")
+    st.subheader("Målgrupp")
+    st.markdown(
+        """
 <span class="pill">Byggfirmor</span>
 <span class="pill">Snickare</span>
 <span class="pill">VVS-firmor</span>
 <span class="pill">Plattsättare</span>
 <span class="pill">Elektriker</span>
 <span class="pill">Målare</span>
-    """,
-    unsafe_allow_html=True,
-)
+        """,
+        unsafe_allow_html=True,
+    )
 
-st.markdown("#### Varför Offertly?")
-st.markdown(
-    """
+    st.write("")
+    st.subheader("Varför Offertly?")
+    st.markdown(
+        """
 - ⏱ Skapa offert på under 1 minut  
 - 📄 Snygg PDF direkt till kund  
 - 💰 Tydlig prisuppdelning  
 - 🧠 AI-text som låter professionell  
 """
-)
+    )
 
+    st.write("")
+    st.subheader("Prisplaner (exempel)")
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        st.markdown(
+            """
+**Starter**  
+### 199 kr/mån
+
+- 50 offerter/mån  
+- PDF + .md  
+- Kundlogo i PDF  
+- Standardmall
+"""
+        )
+    with c2:
+        st.markdown(
+            """
+**Pro (populär)**  
+### 499 kr/mån
+
+- 300 offerter/mån  
+- Premium-PDF  
+- Flera mallar (altan, badrum, VVS)  
+- Spara kunddata
+"""
+        )
+    with c3:
+        st.markdown(
+            """
+**Team**  
+### 1 199 kr/mån
+
+- 1 000 offerter/mån  
+- Flera användare  
+- Offert-historik  
+- Företagsanpassad mall
+"""
+        )
+
+    st.write("")
+    st.subheader("Demo-offert")
+    st.markdown(DEMO_OFFER_MD)
+
+    demo_pdf = generate_pdf_premium(
+        offer_md=DEMO_OFFER_MD,
+        data=DEMO_DATA,
+        customer_logo_bytes=None,
+    )
+
+    st.download_button(
+        "📄 Ladda ner exempel-PDF",
+        data=demo_pdf,
+        file_name="offertly_exempel.pdf",
+        mime="application/pdf",
+        use_container_width=True,
+    )
+
+    st.write("")
+    if st.button("🚀 Testa gratis – skapa en offert", use_container_width=True):
+        st.session_state["page"] = "🧾 Skapa offert"
+        st.rerun()
+
+    st.stop()
+
+
+# =============================
+# SKAPA OFFERT
+# =============================
+st.markdown(f"# {APP_TITLE}")
+st.markdown(f'<div class="muted">{APP_TAGLINE}</div>', unsafe_allow_html=True)
 st.write("")
-st.markdown("#### Prisplaner (exempel)")
-pcol1, pcol2, pcol3 = st.columns(3, gap="medium")
-with pcol1:
-    st.markdown(
-        """
-<div class="pricecard">
-<b>Starter</b><br>
-<span style="font-size:22px;"><b>199 kr/mån</b></span><br><br>
-• 50 offerter/mån<br>
-• PDF + .md<br>
-• Kundlogga i PDF<br>
-• Standardmall<br>
-</div>
-        """,
-        unsafe_allow_html=True,
-    )
-with pcol2:
-    st.markdown(
-        """
-<div class="pricecard" style="border:1px solid rgba(0,0,0,0.18);">
-<b>Pro (populär)</b><br>
-<span style="font-size:22px;"><b>499 kr/mån</b></span><br><br>
-• 300 offerter/mån<br>
-• Premium-PDF<br>
-• Flera mallar (altan, badrum, VVS, m.m.)<br>
-• Spara kunddata<br>
-</div>
-        """,
-        unsafe_allow_html=True,
-    )
-with pcol3:
-    st.markdown(
-        """
-<div class="pricecard">
-<b>Team</b><br>
-<span style="font-size:22px;"><b>1 199 kr/mån</b></span><br><br>
-• 1 000 offerter/mån<br>
-• Flera användare<br>
-• Offert-historik<br>
-• Företagsanpassad mall<br>
-</div>
-        """,
-        unsafe_allow_html=True,
-    )
 
-st.write("")
-st.divider()
-
-# Layout
 form_col, out_col = st.columns([1.05, 1.25], gap="large")
 
 with form_col:
@@ -495,7 +591,7 @@ with form_col:
     gen = st.button("Generera offert", use_container_width=True)
     st.markdown("</div>", unsafe_allow_html=True)
 
-# Generera
+# Generera text
 if gen:
     missing = []
     for val, label in [
@@ -512,7 +608,7 @@ if gen:
     if missing:
         st.error("Fyll i: " + ", ".join(missing))
     else:
-        # nytt offert-id per generering
+        # nytt offert-ID varje gång
         st.session_state.offer_id = generate_offer_id()
 
         d = {
@@ -532,12 +628,12 @@ if gen:
             "price_total": int(total_price),
         }
 
+        # fallback om ingen nyckel / ingen OpenAI
         if (not api_key) or (OpenAI is None):
             st.session_state.offertext = fallback_offer_text(d)
         else:
             client = OpenAI(api_key=api_key)
             prompt = build_prompt(d)
-
             try:
                 with st.spinner("AI skriver offerten…"):
                     resp = client.chat.completions.create(
@@ -545,7 +641,7 @@ if gen:
                         messages=[
                             {
                                 "role": "system",
-                                "content": "Du skriver professionella svenska offerter för byggföretag och VVS-firmor till privatkunder.",
+                                "content": "Du skriver professionella svenska offerter för bygg- och VVS-arbeten till privatkunder.",
                             },
                             {"role": "user", "content": prompt},
                         ],
@@ -559,33 +655,12 @@ if gen:
 
         st.session_state.meta = {"jobb": d["job_type"], "kund": d["customer"], "datum": d["date"]}
 
-# Output
 with out_col:
     st.markdown('<div class="card">', unsafe_allow_html=True)
     st.subheader("Färdig offert")
 
     if not st.session_state.offertext:
         st.info("Fyll i projektdata och klicka 'Generera offert' så dyker den upp här.")
-        # Valfri exempeltext tills första generering (kan tas bort om du vill)
-        st.markdown(
-            """
-**Exempel på hur det kommer se ut:**
-
-## Offert för badrumsrenovering
-**Datum:** 2026-02-12  
-**Kund:** Anna Andersson  
-**Plats/ort:** Göteborg  
-
-### Projektbeskrivning
-Renovering av badrum inklusive rivning, tätskikt, plattsättning och montering.
-
-### Pris
-- Arbete: 85 000 SEK  
-- Material: 40 000 SEK  
-- Övrigt: 5 000 SEK  
-**Total inkl. moms: 130 000 SEK**
-            """
-        )
     else:
         offertext = st.session_state.offertext
         st.markdown(offertext)
@@ -595,8 +670,10 @@ Renovering av badrum inklusive rivning, tätskikt, plattsättning och montering.
 
         meta = st.session_state.meta or {}
         fname_base = f"offert_{safe_filename(meta.get('jobb','jobb'))}_{safe_filename(meta.get('kund','kund'))}_{meta.get('datum','')}"
+
         customer_logo_bytes = customer_logo_file.read() if customer_logo_file else None
 
+        # Premium PDF
         pdf_buffer = generate_pdf_premium(
             offer_md=offertext,
             data={
@@ -633,15 +710,9 @@ Renovering av badrum inklusive rivning, tätskikt, plattsättning och montering.
             use_container_width=True,
         )
 
-        st.download_button(
-            "⬇️ Ladda ner som .txt",
-            data=offertext,
-            file_name=f"{fname_base}.txt",
-            mime="text/plain; charset=utf-8",
-            use_container_width=True,
-        )
-
     st.markdown("</div>", unsafe_allow_html=True)
+
+
 
 
 
