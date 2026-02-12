@@ -1,647 +1,521 @@
 import os
 import re
-import uuid
-from datetime import datetime
-from io import BytesIO
-from typing import Optional
+import sqlite3
+import time
+from dataclasses import dataclass
+from typing import Optional, Dict, Any
 
 import streamlit as st
 
-# OpenAI (nya klienten)
-try:
-    from openai import OpenAI
-except Exception:
-    OpenAI = None  # hanteras i UI
+# Stripe
+import stripe
 
-# PDF (ReportLab)
-from reportlab.lib.pagesizes import A4
-from reportlab.pdfgen import canvas
-from reportlab.lib.units import mm
-from reportlab.lib.utils import ImageReader
+# Password hashing
+import bcrypt
 
 
 # =============================
-# Konfiguration / Branding
+# App Branding / Planer
 # =============================
 APP_NAME = "Offertly"
 APP_TITLE = "Offertly – offertmotor för bygg & VVS"
-APP_TAGLINE = "För byggföretag och VVS-firmor som skickar offerter till privatkunder. Skapa en proffsig offert på under 60 sekunder."
+APP_TAGLINE = "För byggfirmor och VVS-firmor som skickar offerter till privatkunder. Skapa en proffsig offert på under 60 sekunder."
+
+PLANS = {
+    "starter": {
+        "label": "Starter",
+        "price_text": "199 kr/mån",
+        "features": ["50 offerter/mån", "PDF + .md", "Kundlogo i PDF", "Standardmall"],
+        "stripe_price_id_secret": "STRIPE_PRICE_ID_STARTER",
+    },
+    "pro": {
+        "label": "Pro (populär)",
+        "price_text": "499 kr/mån",
+        "features": ["300 offerter/mån", "Premium-PDF", "Flera mallar (altan, badrum, VVS)", "Spara kunddata"],
+        "stripe_price_id_secret": "STRIPE_PRICE_ID_PRO",
+    },
+    "team": {
+        "label": "Team",
+        "price_text": "1 199 kr/mån",
+        "features": ["1 000 offerter/mån", "Flera användare", "Offert-historik", "Företagsanpassad mall"],
+        "stripe_price_id_secret": "STRIPE_PRICE_ID_TEAM",
+    },
+}
 
 
 # =============================
-# Helpers
+# DB (SQLite)
 # =============================
-def safe_filename(s: str) -> str:
-    s = (s or "").lower().strip()
-    s = re.sub(r"\s+", "_", s)
-    s = re.sub(r"[^a-z0-9_\-]", "", s)
-    return (s[:60] or "offert")
+DB_PATH = "offertly.db"
 
 
-def get_api_key() -> Optional[str]:
-    """
-    Försöker läsa OPENAI_API_KEY från:
-      1) Streamlit Secrets (utan att krascha om secrets saknas)
-      2) Miljövariabel
-    """
+def db() -> sqlite3.Connection:
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn.execute("PRAGMA journal_mode=WAL;")
+    return conn
+
+
+def init_db():
+    conn = db()
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            email TEXT UNIQUE NOT NULL,
+            password_hash BLOB NOT NULL,
+            created_at INTEGER NOT NULL,
+            stripe_customer_id TEXT,
+            stripe_subscription_id TEXT,
+            stripe_subscription_status TEXT,
+            plan TEXT
+        );
+        """
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_user_by_email(email: str) -> Optional[dict]:
+    conn = db()
+    cur = conn.execute("SELECT * FROM users WHERE email = ?", (email.lower().strip(),))
+    row = cur.fetchone()
+    conn.close()
+    if not row:
+        return None
+    cols = [d[0] for d in cur.description]  # type: ignore
+    return dict(zip(cols, row))
+
+
+def get_user_by_id(user_id: int) -> Optional[dict]:
+    conn = db()
+    cur = conn.execute("SELECT * FROM users WHERE id = ?", (user_id,))
+    row = cur.fetchone()
+    conn.close()
+    if not row:
+        return None
+    cols = [d[0] for d in cur.description]  # type: ignore
+    return dict(zip(cols, row))
+
+
+def create_user(email: str, password: str) -> Optional[int]:
+    email = email.lower().strip()
+    password_hash = bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt())
+    conn = db()
     try:
-        if hasattr(st, "secrets") and "OPENAI_API_KEY" in st.secrets:
-            v = str(st.secrets["OPENAI_API_KEY"]).strip()
-            return v or None
+        cur = conn.execute(
+            "INSERT INTO users (email, password_hash, created_at) VALUES (?,?,?)",
+            (email, password_hash, int(time.time())),
+        )
+        conn.commit()
+        user_id = cur.lastrowid
+        return int(user_id)
+    except sqlite3.IntegrityError:
+        return None
+    finally:
+        conn.close()
+
+
+def update_user_subscription(
+    user_id: int,
+    *,
+    customer_id: Optional[str] = None,
+    subscription_id: Optional[str] = None,
+    status: Optional[str] = None,
+    plan: Optional[str] = None,
+):
+    conn = db()
+    conn.execute(
+        """
+        UPDATE users
+        SET
+            stripe_customer_id = COALESCE(?, stripe_customer_id),
+            stripe_subscription_id = COALESCE(?, stripe_subscription_id),
+            stripe_subscription_status = COALESCE(?, stripe_subscription_status),
+            plan = COALESCE(?, plan)
+        WHERE id = ?
+        """,
+        (customer_id, subscription_id, status, plan, user_id),
+    )
+    conn.commit()
+    conn.close()
+
+
+# =============================
+# Auth helpers
+# =============================
+def valid_email(email: str) -> bool:
+    return bool(re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", email.strip().lower()))
+
+
+def verify_password(password: str, password_hash: bytes) -> bool:
+    try:
+        return bcrypt.checkpw(password.encode("utf-8"), password_hash)
+    except Exception:
+        return False
+
+
+def login_user(user_id: int):
+    st.session_state["user_id"] = user_id
+
+
+def logout_user():
+    for k in ["user_id"]:
+        if k in st.session_state:
+            del st.session_state[k]
+
+
+def current_user() -> Optional[dict]:
+    uid = st.session_state.get("user_id")
+    if not uid:
+        return None
+    return get_user_by_id(int(uid))
+
+
+def has_active_subscription(u: dict) -> bool:
+    # Stripe status kan vara: active, trialing, past_due, canceled, unpaid, incomplete, etc.
+    # Vi räknar active/trialing som OK.
+    status = (u.get("stripe_subscription_status") or "").lower()
+    return status in ("active", "trialing")
+
+
+# =============================
+# Secrets / Stripe setup
+# =============================
+def get_secret(name: str, default: Optional[str] = None) -> Optional[str]:
+    try:
+        if name in st.secrets:
+            v = str(st.secrets[name]).strip()
+            return v or default
     except Exception:
         pass
-
-    v = os.getenv("OPENAI_API_KEY", "").strip()
-    return v or None
+    return (os.getenv(name) or default)
 
 
-def generate_offer_id() -> str:
-    return "OFF-" + uuid.uuid4().hex[:8].upper()
+def stripe_setup():
+    secret = get_secret("STRIPE_SECRET_KEY")
+    if not secret:
+        return False
+    stripe.api_key = secret
+    return True
 
 
-def build_prompt(d: dict) -> str:
-    return f"""
-Du är en professionell offertskrivare för byggföretag och VVS-firmor som lämnar offerter till privatkunder. Skriv på svenska.
-
-Skapa en tydlig, proffsig och lättläst offert baserat på:
-
-Företag (utförare): {d['company']}
-Kontakt: {d['contact']}
-Datum: {d['date']}
-Beställare/kund: {d['customer']}
-Plats/ort: {d['location']}
-
-Tjänst/arbete: {d['job_type']}
-Omfattning/storlek: {d['size']}
-Material: {d['material']}
-Kommentar/önskemål: {d['comment']}
-
-Prisuppgifter (använd dessa exakt):
-- Arbete: {d['price_work']} SEK
-- Material: {d['price_material']} SEK
-- Övrigt: {d['price_other']} SEK
-- Totalpris inkl. moms: {d['price_total']} SEK
-
-Krav:
-- Använd rubriker: Projektbeskrivning, Arbetsmoment, Material, Tidsplan, Pris, Villkor, Kontakt
-- Arbetsmoment: punktlista (5–10 punkter)
-- Materiallista: punktlista
-- Tidsplan: realistisk (ex: dagar/veckor) och start “enl. överenskommelse”
-- Pris: visa uppdelning + total inkl moms (med SEK)
-- 5–7 korta villkor (giltighetstid, betalning, tillägg/ÄTA, ROT om relevant, garanti, startdatum)
-- Datum ska vara exakt: {d['date']} (skriv inte “[Dagens datum]”)
-- Avsluta med vänlig hälsning + företagets kontakt
-
-Skriv kortfattat, tydligt och professionellt. Undvik överdrivet marknadsföringsspråk.
-"""
+def app_base_url() -> str:
+    # Måste vara en full URL i Stripe redirect (t.ex. https://dinapp.streamlit.app)
+    # Lägg i secrets: APP_BASE_URL="https://..."
+    url = get_secret("APP_BASE_URL")
+    return (url or "").rstrip("/")
 
 
-def draw_wrapped_text(c: canvas.Canvas, text: str, x: float, y: float, max_chars: int, line_h: float):
-    for raw in (text or "").splitlines():
-        line = raw.replace("\t", "    ")
-        if not line.strip():
-            y -= line_h
-            continue
-
-        while len(line) > max_chars:
-            c.drawString(x, y, line[:max_chars])
-            y -= line_h
-            line = line[max_chars:]
-        c.drawString(x, y, line)
-        y -= line_h
-    return y
+# =============================
+# Stripe flows
+# =============================
+def get_price_id(plan_key: str) -> Optional[str]:
+    secret_name = PLANS[plan_key]["stripe_price_id_secret"]
+    return get_secret(secret_name)
 
 
-def generate_pdf_premium(
-    offer_md: str,
-    data: dict,
-    customer_logo_bytes: Optional[bytes] = None,
-) -> bytes:
-    buf = BytesIO()
-    c = canvas.Canvas(buf, pagesize=A4)
-    width, height = A4
+def create_checkout_session(user: dict, plan_key: str) -> str:
+    base = app_base_url()
+    if not base:
+        raise RuntimeError("APP_BASE_URL saknas i Secrets. Ex: https://dinapp.streamlit.app")
 
-    margin = 18 * mm
-    x = margin
-    y = height - margin
+    price_id = get_price_id(plan_key)
+    if not price_id:
+        raise RuntimeError(f"Saknar Stripe Price ID i Secrets: {PLANS[plan_key]['stripe_price_id_secret']}")
 
-    # Header
-    c.setFont("Helvetica-Bold", 16)
-    c.drawString(x, y, "OFFERT")
-    c.setFont("Helvetica", 10)
-    c.drawRightString(width - margin, y, APP_NAME)
-    y -= 10 * mm
+    customer_email = user["email"]
 
-    # Kundens logga (uppladdad)
-    if customer_logo_bytes:
-        try:
-            img = ImageReader(BytesIO(customer_logo_bytes))
-            logo_w = 42 * mm
-            logo_h = 24 * mm
-            c.drawImage(
-                img,
-                width - margin - logo_w,
-                height - margin - logo_h - 6 * mm,
-                logo_w,
-                logo_h,
-                mask="auto",
-                preserveAspectRatio=True,
-                anchor="c",
+    # Skapa Checkout Session (subscription)
+    session = stripe.checkout.Session.create(
+        mode="subscription",
+        line_items=[{"price": price_id, "quantity": 1}],
+        success_url=f"{base}?success=1&session_id={{CHECKOUT_SESSION_ID}}",
+        cancel_url=f"{base}?canceled=1",
+        customer_email=customer_email,
+        allow_promotion_codes=True,
+        metadata={
+            "user_id": str(user["id"]),
+            "plan_key": plan_key,
+            "app": APP_NAME,
+        },
+    )
+    return session.url  # type: ignore
+
+
+def sync_subscription_from_stripe(user: dict):
+    """
+    För Streamlit utan webhooks: vi kan "synka" på login/refresh.
+    Om användaren har subscription_id, läs status från Stripe och spara lokalt.
+    """
+    if not stripe_setup():
+        return
+
+    sub_id = user.get("stripe_subscription_id")
+    if not sub_id:
+        return
+
+    try:
+        sub = stripe.Subscription.retrieve(sub_id)
+        status = (sub.get("status") or "").lower()
+        update_user_subscription(user["id"], status=status)
+    except Exception:
+        # Ignorera tyst – bättre UX än crash.
+        return
+
+
+def handle_stripe_success_callback(user: dict):
+    """
+    När Stripe redirectar tillbaka med ?success=1&session_id=...
+    verifiera session -> hämta customer + subscription -> spara.
+    """
+    if not stripe_setup():
+        st.error("Stripe är inte konfigurerat (STRIPE_SECRET_KEY saknas).")
+        return
+
+    params = st.query_params
+    success = params.get("success")
+    session_id = params.get("session_id")
+
+    if not success or not session_id:
+        return
+
+    try:
+        sess = stripe.checkout.Session.retrieve(session_id)
+        customer_id = sess.get("customer")
+        subscription_id = sess.get("subscription")
+
+        # Ta plan från metadata om möjligt
+        plan_key = None
+        md = sess.get("metadata") or {}
+        if isinstance(md, dict):
+            plan_key = md.get("plan_key")
+
+        status = None
+        if subscription_id:
+            sub = stripe.Subscription.retrieve(subscription_id)
+            status = (sub.get("status") or "").lower()
+
+        update_user_subscription(
+            user["id"],
+            customer_id=str(customer_id) if customer_id else None,
+            subscription_id=str(subscription_id) if subscription_id else None,
+            status=status,
+            plan=plan_key,
+        )
+
+        # rensa query params för snygg url
+        st.query_params.clear()
+        st.success("✅ Betalning klar! Ditt konto är nu aktivt.")
+    except Exception as e:
+        st.error(f"Kunde inte verifiera betalningen: {e}")
+
+
+# =============================
+# UI Components
+# =============================
+def pricing_cards():
+    st.markdown("### Prisplaner (exempel)")
+    cols = st.columns(3)
+    for i, (key, plan) in enumerate(PLANS.items()):
+        with cols[i]:
+            st.markdown(
+                f"""
+                <div style="
+                    border: 1px solid rgba(0,0,0,0.10);
+                    border-radius: 16px;
+                    padding: 16px;
+                    background: rgba(255,255,255,0.75);
+                    min-height: 210px;
+                ">
+                  <div style="font-weight:700; font-size:16px;">{plan['label']}</div>
+                  <div style="font-size:24px; font-weight:800; margin-top:6px;">{plan['price_text']}</div>
+                  <div style="margin-top:10px; opacity:0.85;">
+                    <ul style="padding-left: 18px; margin: 0;">
+                      {''.join([f"<li>{x}</li>" for x in plan["features"]])}
+                    </ul>
+                  </div>
+                </div>
+                """,
+                unsafe_allow_html=True,
             )
-        except Exception:
-            pass
-
-    # Meta-rad
-    c.setFont("Helvetica", 10)
-    c.drawString(x, y, f"Offert-ID: {data.get('offer_id','')}")
-    c.drawRightString(width - margin, y, f"Datum: {data.get('date','')}")
-    y -= 8 * mm
-
-    # Företag
-    c.setFont("Helvetica-Bold", 11)
-    c.drawString(x, y, data.get("company", ""))
-    y -= 5.5 * mm
-    c.setFont("Helvetica", 10)
-    y = draw_wrapped_text(c, f"Kontakt: {data.get('contact','')}", x, y, 95, 5.2 * mm)
-    y -= 2 * mm
-
-    # Kund
-    c.setFont("Helvetica-Bold", 11)
-    c.drawString(x, y, f"Kund: {data.get('customer','')}")
-    y -= 5.5 * mm
-    c.setFont("Helvetica", 10)
-    c.drawString(x, y, f"Plats/ort: {data.get('location','')}")
-    y -= 8 * mm
-
-    # Tjänstinfo
-    c.setFont("Helvetica-Bold", 11)
-    c.drawString(x, y, f"Tjänst: {data.get('job_type','')}")
-    y -= 5.5 * mm
-    c.setFont("Helvetica", 10)
-    c.drawString(x, y, f"Omfattning: {data.get('size','')}")
-    y -= 5.5 * mm
-    c.drawString(x, y, f"Material: {data.get('material','')}")
-    y -= 8 * mm
-
-    # Prisruta
-    box_w = width - 2 * margin
-    box_h = 26 * mm
-    c.roundRect(x, y - box_h + 6 * mm, box_w, box_h, 6, stroke=1, fill=0)
-    c.setFont("Helvetica-Bold", 11)
-    c.drawString(x + 6 * mm, y, "Prisöversikt")
-    c.setFont("Helvetica", 10)
-    c.drawRightString(x + box_w - 6 * mm, y, "SEK (inkl. moms)")
-    y -= 6.5 * mm
-    c.drawString(x + 6 * mm, y, f"Arbete: {data.get('price_work','')} SEK")
-    c.drawRightString(x + box_w - 6 * mm, y, f"Material: {data.get('price_material','')} SEK")
-    y -= 5.5 * mm
-    c.drawString(x + 6 * mm, y, f"Övrigt: {data.get('price_other','')} SEK")
-    c.drawRightString(x + box_w - 6 * mm, y, f"Total: {data.get('price_total','')} SEK")
-    y -= 12 * mm
-
-    # Offerttext
-    c.setFont("Helvetica-Bold", 12)
-    c.drawString(x, y, "Offerttext")
-    y -= 7 * mm
-    c.setFont("Helvetica", 10)
-
-    line_h = 5.2 * mm
-
-    def new_page():
-        nonlocal y
-        c.showPage()
-        y = height - margin
-        c.setFont("Helvetica", 10)
-
-    for raw in (offer_md or "").splitlines():
-        line = raw.replace("\t", "    ").strip()
-
-        # Rubriker i markdown
-        if line.startswith("#"):
-            line = line.lstrip("#").strip()
-            y -= 2 * mm
-            c.setFont("Helvetica-Bold", 11)
-            c.drawString(x, y, line)
-            c.setFont("Helvetica", 10)
-            y -= 6 * mm
-            if y < margin:
-                new_page()
-            continue
-
-        # bullets
-        if line.startswith(("-", "•")):
-            line = "• " + line.lstrip("-• ").strip()
-
-        # wrap
-        while len(line) > 110:
-            c.drawString(x, y, line[:110])
-            y -= line_h
-            line = line[110:]
-            if y < margin:
-                new_page()
-
-        c.drawString(x, y, line)
-        y -= line_h
-        if y < margin:
-            new_page()
-
-    c.save()
-    buf.seek(0)
-    return buf.read()
 
 
-def fallback_offer_text(d: dict) -> str:
-    return f"""# Offert för {d['job_type']}
+def auth_box():
+    st.markdown("## Logga in")
+    tab1, tab2 = st.tabs(["Logga in", "Skapa konto"])
 
-**Offert-ID:** {d['offer_id']}  
-**Datum:** {d['date']}  
-**Företag:** {d['company']}  
-**Kontakt:** {d['contact']}  
-**Kund:** {d['customer']}  
-**Plats/ort:** {d['location']}
+    with tab1:
+        email = st.text_input("E-post", key="login_email")
+        password = st.text_input("Lösenord", type="password", key="login_password")
+        if st.button("Logga in", use_container_width=True):
+            if not valid_email(email):
+                st.error("Ange en giltig e-postadress.")
+                return
+            u = get_user_by_email(email)
+            if not u:
+                st.error("Fel e-post eller lösenord.")
+                return
+            if not verify_password(password, u["password_hash"]):
+                st.error("Fel e-post eller lösenord.")
+                return
+            login_user(u["id"])
+            st.rerun()
 
-## Projektbeskrivning
-Vi lämnar härmed offert för **{d['job_type']}** enligt angivna uppgifter.
-
-## Arbetsmoment
-- Genomgång av förutsättningar på plats
-- Planering och materialbeställning
-- Utförande av arbetet enligt överenskommelse
-- Avstämning med kund och avslut
-
-## Material
-- {d['material']}
-
-## Tidsplan
-Startdatum: enligt överenskommelse. Utförandetid: beror på omfattning (normalt 1–4 veckor).
-
-## Pris
-- Arbete: {d['price_work']} SEK  
-- Material: {d['price_material']} SEK  
-- Övrigt: {d['price_other']} SEK  
-**Totalpris inkl. moms:** {d['price_total']} SEK
-
-## Villkor
-1. Offerten gäller i 30 dagar.
-2. Betalningsvillkor: 10–30 dagar enligt överenskommelse.
-3. Eventuellt tilläggsarbete/ÄTA prissätts separat efter godkännande.
-4. Startdatum enligt överenskommelse.
-5. ROT-avdrag hanteras enligt gällande regler (om tillämpligt).
-6. Garanti enligt konsumenttjänstlagen och branschpraxis.
-
-## Kontakt
-{d['company']} – {d['contact']}
-
-Vänliga hälsningar,  
-{d['company']}
-"""
+    with tab2:
+        email = st.text_input("E-post", key="signup_email")
+        password = st.text_input("Lösenord (minst 8 tecken)", type="password", key="signup_password")
+        password2 = st.text_input("Upprepa lösenord", type="password", key="signup_password2")
+        if st.button("Skapa konto", use_container_width=True):
+            if not valid_email(email):
+                st.error("Ange en giltig e-postadress.")
+                return
+            if len(password) < 8:
+                st.error("Lösenordet måste vara minst 8 tecken.")
+                return
+            if password != password2:
+                st.error("Lösenorden matchar inte.")
+                return
+            user_id = create_user(email, password)
+            if not user_id:
+                st.error("Det finns redan ett konto med den e-postadressen.")
+                return
+            login_user(user_id)
+            st.success("✅ Konto skapat!")
+            st.rerun()
 
 
-# =============================
-# UI
-# =============================
-st.set_page_config(page_title=APP_NAME, page_icon="📄", layout="wide")
+def paywall(user: dict):
+    st.markdown("## Aktivera konto")
+    st.caption("För att använda Offertly behöver du en aktiv prenumeration.")
+    pricing_cards()
 
-st.markdown(
-    """
-    <style>
-      .block-container { padding-top: 1.2rem; padding-bottom: 2rem; }
-      .card {
-        border: 1px solid rgba(0,0,0,0.08);
-        border-radius: 18px;
-        padding: 18px;
-        background: rgba(255,255,255,0.75);
-      }
-      .muted { opacity: 0.75; }
-      .stButton button, .stDownloadButton button {
-        border-radius: 12px !important;
-        padding: 0.65rem 1rem !important;
-      }
-      .pill {
-        display:inline-block;
-        padding: 6px 10px;
-        border-radius: 999px;
-        border: 1px solid rgba(0,0,0,0.08);
-        margin-right: 8px;
-        margin-bottom: 8px;
-        font-size: 0.9rem;
-        background: rgba(255,255,255,0.65);
-      }
-      .pricecard {
-        border: 1px solid rgba(0,0,0,0.08);
-        border-radius: 16px;
-        padding: 14px;
-        background: rgba(255,255,255,0.75);
-      }
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
+    st.write("")
+    c1, c2, c3 = st.columns(3)
+    btns = [("starter", c1), ("pro", c2), ("team", c3)]
+    for plan_key, col in btns:
+        with col:
+            if st.button(f"Välj {PLANS[plan_key]['label']}", use_container_width=True):
+                try:
+                    url = create_checkout_session(user, plan_key)
+                    st.link_button("Fortsätt till betalning", url, use_container_width=True)
+                    st.info("Om knappen inte öppnar, kopiera länken och öppna i ny flik.")
+                    st.code(url)
+                except Exception as e:
+                    st.error(str(e))
 
-api_key = get_api_key()
-
-# Session state
-if "offertext" not in st.session_state:
-    st.session_state.offertext = ""
-if "meta" not in st.session_state:
-    st.session_state.meta = {}
-if "offer_id" not in st.session_state:
-    st.session_state.offer_id = generate_offer_id()
-
-# Sidebar
-with st.sidebar:
-    st.markdown(f"## {APP_NAME}")
-    st.caption("Automatisera offerter och vinn fler jobb.")
-
-    # Visa app-logga om den finns (valfritt)
-    if os.path.exists("logo.png"):
-        st.image("logo.png", use_container_width=True)
-
-    st.divider()
-    st.markdown("### Inställningar")
-
-    if api_key:
-        st.success("OPENAI_API_KEY hittad")
-    else:
-        st.warning("Ingen OPENAI_API_KEY hittad (fallback-mall används).")
-        st.caption('Lägg nyckeln i Streamlit Secrets som:\n\nOPENAI_API_KEY = "sk-..."')
-
-    st.divider()
-    st.markdown("### Kundens logo (valfritt)")
-    st.caption("Loggan som syns i PDF-offerten (PNG/JPG).")
-    customer_logo_file = st.file_uploader(" ", type=["png", "jpg", "jpeg"], label_visibility="collapsed")
-
-    st.divider()
-    st.markdown("### Tips")
-    st.caption("Använd kundens logga i PDF när du skickar offerten till privatkunden.")
+    st.write("")
+    if st.button("🔄 Jag har redan betalat – uppdatera status", use_container_width=True):
+        sync_subscription_from_stripe(user)
+        st.rerun()
 
 
-# Header / säljcopy
-st.markdown(f"# {APP_TITLE}")
-st.markdown(f'<div class="muted">{APP_TAGLINE}</div>', unsafe_allow_html=True)
-st.write("")
+def main_app_ui(user: dict):
+    st.markdown(f"# {APP_TITLE}")
+    st.markdown(f"<div style='opacity:.75'>{APP_TAGLINE}</div>", unsafe_allow_html=True)
+    st.write("")
 
-st.markdown("#### Målgrupp")
-st.markdown(
-    """
-<span class="pill">Byggfirmor</span>
-<span class="pill">Snickare</span>
-<span class="pill">VVS-firmor</span>
-<span class="pill">Plattsättare</span>
-<span class="pill">Elektriker</span>
-<span class="pill">Målare</span>
-    """,
-    unsafe_allow_html=True,
-)
+    st.markdown("### Målgrupp")
+    chips = ["Byggfirmor", "Snickare", "VVS-firmor", "Plattsättare", "Elektriker", "Målare"]
+    st.write(" ".join([f"`{c}`" for c in chips]))
 
-st.markdown("#### Varför Offertly?")
-st.markdown(
-    """
+    st.write("")
+    st.markdown("### Varför Offertly?")
+    st.markdown(
+        """
 - ⏱ Skapa offert på under 1 minut  
 - 📄 Snygg PDF direkt till kund  
 - 💰 Tydlig prisuppdelning  
 - 🧠 AI-text som låter professionell  
 """
+    )
+
+    st.write("")
+    st.divider()
+
+    # --- Här kopplar du in din offert-generator UI ---
+    st.markdown("## Offertgenerator")
+    st.info("Här kopplar vi in din befintliga offert-generator (formulär + PDF).")
+
+    # Exempel "gated" funktion:
+    st.text_input("Företagsnamn", value="")
+    st.text_input("Kundens namn", value="")
+    st.text_area("Beskrivning", value="")
+    st.button("Generera offert (AI)", use_container_width=True)
+
+
+# =============================
+# Page layout + Sidebar
+# =============================
+st.set_page_config(page_title=APP_NAME, page_icon="📄", layout="wide")
+
+st.markdown(
+    """
+<style>
+.block-container { padding-top: 1.2rem; padding-bottom: 2rem; }
+.stButton button, .stDownloadButton button {
+  border-radius: 12px !important;
+  padding: .65rem 1rem !important;
+}
+</style>
+""",
+    unsafe_allow_html=True,
 )
 
-st.write("")
-st.markdown("#### Prisplaner (exempel)")
-pcol1, pcol2, pcol3 = st.columns(3, gap="medium")
-with pcol1:
-    st.markdown(
-        """
-<div class="pricecard">
-<b>Starter</b><br>
-<span style="font-size:22px;"><b>199 kr/mån</b></span><br><br>
-• 50 offerter/mån<br>
-• PDF + .md<br>
-• Kundlogga i PDF<br>
-• Standardmall<br>
-</div>
-        """,
-        unsafe_allow_html=True,
-    )
-with pcol2:
-    st.markdown(
-        """
-<div class="pricecard" style="border:1px solid rgba(0,0,0,0.18);">
-<b>Pro (populär)</b><br>
-<span style="font-size:22px;"><b>499 kr/mån</b></span><br><br>
-• 300 offerter/mån<br>
-• Premium-PDF<br>
-• Flera mallar (altan, badrum, VVS, m.m.)<br>
-• Spara kunddata<br>
-</div>
-        """,
-        unsafe_allow_html=True,
-    )
-with pcol3:
-    st.markdown(
-        """
-<div class="pricecard">
-<b>Team</b><br>
-<span style="font-size:22px;"><b>1 199 kr/mån</b></span><br><br>
-• 1 000 offerter/mån<br>
-• Flera användare<br>
-• Offert-historik<br>
-• Företagsanpassad mall<br>
-</div>
-        """,
-        unsafe_allow_html=True,
-    )
+init_db()
 
-st.write("")
-st.divider()
+with st.sidebar:
+    st.markdown(f"## {APP_NAME}")
 
-# Layout
-form_col, out_col = st.columns([1.05, 1.25], gap="large")
+    # Visa din logo om du har "logo.png" i repo
+    if os.path.exists("logo.png"):
+        st.image("logo.png", use_container_width=True)
 
-with form_col:
-    st.markdown('<div class="card">', unsafe_allow_html=True)
-    st.subheader("Projektdata")
-
-    c1, c2 = st.columns(2)
-    with c1:
-        company = st.text_input("Företagsnamn (utförare)", value="")
-        contact = st.text_input("Kontaktinfo (tel/mejl)", value="")
-    with c2:
-        date_str = st.date_input("Datum", value=datetime.now()).strftime("%Y-%m-%d")
-        location = st.text_input("Plats/ort", value="")
-
-    customer = st.text_input("Beställare / kundens namn", value="")
-    job_type = st.text_input("Tjänst / typ av jobb", value="")
-    size = st.text_input("Omfattning / storlek", value="")
-    material = st.text_input("Material", value="")
-
-    st.write("")
-    st.markdown("#### Pris (SEK)")
-    p1, p2, p3 = st.columns(3)
-    with p1:
-        price_work = st.number_input("Arbete", min_value=0, value=0, step=500)
-    with p2:
-        price_material = st.number_input("Material", min_value=0, value=0, step=500)
-    with p3:
-        price_other = st.number_input("Övrigt", min_value=0, value=0, step=500)
-
-    total_price = int(price_work + price_material + price_other)
-
-    comment = st.text_area(
-        "Kommentar / önskemål (valfritt)",
-        height=110,
-        placeholder="T.ex. ROT, tidsönskemål, specifika material, budget…",
-    )
-
-    st.write("")
-    gen = st.button("Generera offert", use_container_width=True)
-    st.markdown("</div>", unsafe_allow_html=True)
-
-# Generera
-if gen:
-    missing = []
-    for val, label in [
-        (company, "Företagsnamn"),
-        (contact, "Kontaktinfo"),
-        (customer, "Kundens namn"),
-        (location, "Plats/ort"),
-        (job_type, "Typ av jobb"),
-        (size, "Omfattning / storlek"),
-    ]:
-        if not str(val).strip():
-            missing.append(label)
-
-    if missing:
-        st.error("Fyll i: " + ", ".join(missing))
+    st.divider()
+    u = current_user()
+    if u:
+        st.caption(f"Inloggad som: **{u['email']}**")
+        plan = u.get("plan") or "-"
+        status = u.get("stripe_subscription_status") or "-"
+        st.caption(f"Plan: **{plan}**")
+        st.caption(f"Status: **{status}**")
+        if st.button("Logga ut", use_container_width=True):
+            logout_user()
+            st.rerun()
     else:
-        # nytt offert-id per generering
-        st.session_state.offer_id = generate_offer_id()
+        st.caption("Inte inloggad")
 
-        d = {
-            "company": company.strip(),
-            "contact": contact.strip(),
-            "date": date_str,
-            "customer": customer.strip(),
-            "location": location.strip(),
-            "job_type": job_type.strip(),
-            "size": size.strip(),
-            "material": material.strip(),
-            "comment": comment.strip(),
-            "offer_id": st.session_state.offer_id,
-            "price_work": int(price_work),
-            "price_material": int(price_material),
-            "price_other": int(price_other),
-            "price_total": int(total_price),
-        }
+    st.divider()
+    # “config check”
+    ok_stripe = bool(get_secret("STRIPE_SECRET_KEY"))
+    st.caption("Stripe: " + ("✅ OK" if ok_stripe else "⚠️ saknas STRIPE_SECRET_KEY"))
+    ok_base = bool(app_base_url())
+    st.caption("APP_BASE_URL: " + ("✅ OK" if ok_base else "⚠️ saknas APP_BASE_URL"))
 
-        if (not api_key) or (OpenAI is None):
-            st.session_state.offertext = fallback_offer_text(d)
-        else:
-            client = OpenAI(api_key=api_key)
-            prompt = build_prompt(d)
 
-            try:
-                with st.spinner("AI skriver offerten…"):
-                    resp = client.chat.completions.create(
-                        model="gpt-4o-mini",
-                        messages=[
-                            {
-                                "role": "system",
-                                "content": "Du skriver professionella svenska offerter för byggföretag och VVS-firmor till privatkunder.",
-                            },
-                            {"role": "user", "content": prompt},
-                        ],
-                        temperature=0.3,
-                        max_tokens=900,
-                    )
-                st.session_state.offertext = resp.choices[0].message.content
-            except Exception as e:
-                st.session_state.offertext = ""
-                st.error(f"Kunde inte generera offert: {e}")
+# =============================
+# Flow
+# =============================
+user = current_user()
 
-        st.session_state.meta = {"jobb": d["job_type"], "kund": d["customer"], "datum": d["date"]}
+if not user:
+    auth_box()
+    st.stop()
 
-# Output
-with out_col:
-    st.markdown('<div class="card">', unsafe_allow_html=True)
-    st.subheader("Färdig offert")
+# Om vi kommer tillbaka från Stripe efter betalning
+handle_stripe_success_callback(user)
 
-    if not st.session_state.offertext:
-        st.info("Fyll i projektdata och klicka 'Generera offert' så dyker den upp här.")
-        # Valfri exempeltext tills första generering (kan tas bort om du vill)
-        st.markdown(
-            """
-**Exempel på hur det kommer se ut:**
+# Synka status (utan webhooks) när man är inloggad
+sync_subscription_from_stripe(user)
+user = current_user()  # hämta igen efter sync
 
-## Offert för badrumsrenovering
-**Datum:** 2026-02-12  
-**Kund:** Anna Andersson  
-**Plats/ort:** Göteborg  
+if not has_active_subscription(user):
+    paywall(user)
+    st.stop()
 
-### Projektbeskrivning
-Renovering av badrum inklusive rivning, tätskikt, plattsättning och montering.
+# Aktiv prenumeration -> visa appen
+main_app_ui(user)
 
-### Pris
-- Arbete: 85 000 SEK  
-- Material: 40 000 SEK  
-- Övrigt: 5 000 SEK  
-**Total inkl. moms: 130 000 SEK**
-            """
-        )
-    else:
-        offertext = st.session_state.offertext
-        st.markdown(offertext)
-
-        st.write("")
-        st.markdown("### Ladda ner")
-
-        meta = st.session_state.meta or {}
-        fname_base = f"offert_{safe_filename(meta.get('jobb','jobb'))}_{safe_filename(meta.get('kund','kund'))}_{meta.get('datum','')}"
-        customer_logo_bytes = customer_logo_file.read() if customer_logo_file else None
-
-        pdf_buffer = generate_pdf_premium(
-            offer_md=offertext,
-            data={
-                "company": company.strip(),
-                "contact": contact.strip(),
-                "customer": customer.strip(),
-                "location": location.strip(),
-                "job_type": job_type.strip(),
-                "size": size.strip(),
-                "material": material.strip(),
-                "date": date_str,
-                "offer_id": st.session_state.offer_id,
-                "price_work": int(price_work),
-                "price_material": int(price_material),
-                "price_other": int(price_other),
-                "price_total": int(total_price),
-            },
-            customer_logo_bytes=customer_logo_bytes,
-        )
-
-        st.download_button(
-            "📄 Ladda ner premium-PDF",
-            data=pdf_buffer,
-            file_name=f"{fname_base}_premium.pdf",
-            mime="application/pdf",
-            use_container_width=True,
-        )
-
-        st.download_button(
-            "⬇️ Ladda ner som .md",
-            data=offertext,
-            file_name=f"{fname_base}.md",
-            mime="text/markdown; charset=utf-8",
-            use_container_width=True,
-        )
-
-        st.download_button(
-            "⬇️ Ladda ner som .txt",
-            data=offertext,
-            file_name=f"{fname_base}.txt",
-            mime="text/plain; charset=utf-8",
-            use_container_width=True,
-        )
-
-    st.markdown("</div>", unsafe_allow_html=True)
+ 
 
 
 
@@ -649,6 +523,7 @@ Renovering av badrum inklusive rivning, tätskikt, plattsättning och montering.
 
 
     
+
 
 
 
