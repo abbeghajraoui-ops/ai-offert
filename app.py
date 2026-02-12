@@ -24,8 +24,8 @@ from reportlab.lib.utils import ImageReader
 # Konfiguration / Branding
 # =============================
 APP_NAME = "Offertly"
-APP_TITLE = "Offertly – AI-offertgenerator"
-APP_TAGLINE = "Fyll i uppgifterna → generera offert → ladda ner som premium-PDF eller .md"
+APP_TITLE = "Offertly – offertmotor för byggbolag"
+APP_TAGLINE = "Skapa professionella offerter på under 60 sekunder."
 
 
 # =============================
@@ -514,6 +514,7 @@ with out_col:
         )
 
     st.markdown("</div>", unsafe_allow_html=True)
+
 
 
 
