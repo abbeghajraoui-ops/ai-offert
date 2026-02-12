@@ -44,22 +44,18 @@ def get_api_key() -> Optional[str]:
       1) Streamlit Secrets (utan att krascha om secrets saknas)
       2) Miljövariabel
     """
-    # 1) Streamlit Secrets
     try:
-        # st.secrets kan kasta StreamlitSecretNotFoundError om secrets.toml saknas
         if "OPENAI_API_KEY" in st.secrets:
             v = str(st.secrets["OPENAI_API_KEY"]).strip()
             return v or None
     except Exception:
         pass
 
-    # 2) Miljövariabel
     v = os.getenv("OPENAI_API_KEY", "").strip()
     return v or None
 
 
 def generate_offer_id() -> str:
-    # Kort, snyggt offert-ID
     return "OFF-" + uuid.uuid4().hex[:8].upper()
 
 
@@ -101,9 +97,6 @@ Skriv kortfattat, tydligt och professionellt.
 
 
 def draw_wrapped_text(c: canvas.Canvas, text: str, x: float, y: float, max_chars: int, line_h: float):
-    """
-    Enkel radbrytning för PDF.
-    """
     for raw in (text or "").splitlines():
         line = raw.replace("\t", "    ")
         if not line.strip():
@@ -124,9 +117,6 @@ def generate_pdf_premium(
     data: dict,
     customer_logo_bytes: Optional[bytes] = None,
 ) -> bytes:
-    """
-    Premium PDF: header, metadata, kundlogo (om uppladdad), och offert-text.
-    """
     buf = BytesIO()
     c = canvas.Canvas(buf, pagesize=A4)
     width, height = A4
@@ -146,20 +136,26 @@ def generate_pdf_premium(
     if customer_logo_bytes:
         try:
             img = ImageReader(BytesIO(customer_logo_bytes))
-            # placera uppe till höger, lagom stor
             logo_w = 38 * mm
             logo_h = 22 * mm
-            c.drawImage(img, width - margin - logo_w, height - margin - logo_h - 6 * mm, logo_w, logo_h, mask='auto')
+            c.drawImage(
+                img,
+                width - margin - logo_w,
+                height - margin - logo_h - 6 * mm,
+                logo_w,
+                logo_h,
+                mask="auto",
+            )
         except Exception:
             pass
 
-    # Meta-rad
+    # Meta
     c.setFont("Helvetica", 10)
     c.drawString(x, y, f"Offert-ID: {data.get('offer_id','')}")
     c.drawRightString(width - margin, y, f"Datum: {data.get('date','')}")
     y -= 8 * mm
 
-    # Företagsblock
+    # Företag
     c.setFont("Helvetica-Bold", 11)
     c.drawString(x, y, data.get("company", ""))
     y -= 5.5 * mm
@@ -167,7 +163,7 @@ def generate_pdf_premium(
     y = draw_wrapped_text(c, f"Kontakt: {data.get('contact','')}", x, y, 95, 5.2 * mm)
     y -= 2 * mm
 
-    # Kundblock
+    # Kund
     c.setFont("Helvetica-Bold", 11)
     c.drawString(x, y, f"Kund: {data.get('customer','')}")
     y -= 5.5 * mm
@@ -175,7 +171,7 @@ def generate_pdf_premium(
     c.drawString(x, y, f"Plats/ort: {data.get('location','')}")
     y -= 8 * mm
 
-    # Tjänstinfo
+    # Tjänst
     c.setFont("Helvetica-Bold", 11)
     c.drawString(x, y, f"Tjänst: {data.get('job_type','')}")
     y -= 5.5 * mm
@@ -201,12 +197,11 @@ def generate_pdf_premium(
     c.drawRightString(x + box_w - 6 * mm, y, f"Total: {data.get('price_total','')}")
     y -= 12 * mm
 
-    # Offerttext (markdown-ish, vi skriver som ren text)
+    # Offerttext
     c.setFont("Helvetica-Bold", 12)
     c.drawString(x, y, "Offerttext")
     y -= 7 * mm
     c.setFont("Helvetica", 10)
-
     line_h = 5.2 * mm
 
     def new_page():
@@ -215,10 +210,9 @@ def generate_pdf_premium(
         y = height - margin
         c.setFont("Helvetica", 10)
 
-    # skriv offerttext
     for raw in (offer_md or "").splitlines():
         line = raw.replace("\t", "    ").strip()
-        # gör rubriker lite tydligare
+
         if line.startswith("#"):
             line = line.lstrip("#").strip()
             y -= 2 * mm
@@ -230,11 +224,9 @@ def generate_pdf_premium(
                 new_page()
             continue
 
-        # bullets
         if line.startswith(("-", "•")):
             line = "• " + line.lstrip("-• ").strip()
 
-        # wrap
         while len(line) > 110:
             c.drawString(x, y, line[:110])
             y -= line_h
@@ -279,45 +271,7 @@ st.markdown(
 
 api_key = get_api_key()
 
-with st.sidebar:
-    st.markdown(f"## {APP_NAME}")
-    st.caption("Automatisera offerter och vinn fler affärer.")
-st.markdown("#### Varför Offertly?")
-st.markdown("""
-- ⏱ Skapa offert på under 1 minut  
-- 📄 Snygg PDF direkt till kund  
-- 💰 Tydlig prisuppdelning  
-- 🧠 AI-text som låter professionell  
-""")
-
-    # Om du har en app-logga i projektmappen (t.ex. logo.png)
-    if os.path.exists("logo.png"):
-        st.image("logo.png", use_container_width=True)
-
-    st.divider()
-    st.markdown("### Inställningar")
-
-    if api_key:
-        st.success("OPENAI_API_KEY hittad")
-    else:
-        st.warning("Ingen OPENAI_API_KEY hittad (fallback-mall används).")
-        st.caption('Lägg nyckeln i Streamlit Secrets som:\n\nOPENAI_API_KEY = "sk-..."')
-
-    st.divider()
-    st.markdown("### Kundens logo (valfritt)")
-    st.caption("Ladda upp logo för PDF (PNG/JPG)")
-    customer_logo_file = st.file_uploader(" ", type=["png", "jpg", "jpeg"], label_visibility="collapsed")
-
-    st.divider()
-    st.markdown("### Tips")
-    st.caption("Det är kundens logo som ska synas i PDF-offerten.")
-
-
-st.markdown(f"# {APP_TITLE}")
-st.markdown(f'<div class="muted">{APP_TAGLINE}</div>', unsafe_allow_html=True)
-st.write("")
-
-# session state
+# Session state
 if "offertext" not in st.session_state:
     st.session_state.offertext = """
 ## Offert för Altanbygge
@@ -357,13 +311,55 @@ Arbetet beräknas ta cirka 5 arbetsdagar.
 - Eventuella tillägg debiteras separat
 - Start enligt överenskommelse
 """
-
 if "meta" not in st.session_state:
     st.session_state.meta = {}
+if "offer_id" not in st.session_state:
+    st.session_state.offer_id = generate_offer_id()
 
+# Sidebar
+with st.sidebar:
+    st.markdown(f"## {APP_NAME}")
+    st.caption("Automatisera offerter och vinn fler affärer.")
 
+    if os.path.exists("logo.png"):
+        st.image("logo.png", use_container_width=True)
+
+    st.divider()
+    st.markdown("### Inställningar")
+
+    if api_key:
+        st.success("OPENAI_API_KEY hittad")
+    else:
+        st.warning("Ingen OPENAI_API_KEY hittad (fallback-mall används).")
+        st.caption('Lägg nyckeln i Streamlit Secrets som:\n\nOPENAI_API_KEY = "sk-..."')
+
+    st.divider()
+    st.markdown("### Kundens logo (valfritt)")
+    st.caption("Ladda upp logo för PDF (PNG/JPG)")
+    customer_logo_file = st.file_uploader(" ", type=["png", "jpg", "jpeg"], label_visibility="collapsed")
+
+    st.divider()
+    st.markdown("### Tips")
+    st.caption("Det är kundens logo som ska synas i PDF-offerten.")
+
+# Header
+st.markdown(f"# {APP_TITLE}")
+st.markdown(f'<div class="muted">{APP_TAGLINE}</div>', unsafe_allow_html=True)
+st.write("")
+st.markdown("#### Varför Offertly?")
+st.markdown(
+    """
+- ⏱ Skapa offert på under 1 minut  
+- 📄 Snygg PDF direkt till kund  
+- 💰 Tydlig prisuppdelning  
+- 🧠 AI-text som låter professionell  
+"""
+)
+
+st.write("")
 form_col, out_col = st.columns([1.05, 1.25], gap="large")
 
+# Form
 with form_col:
     st.markdown('<div class="card">', unsafe_allow_html=True)
     st.subheader("Projektdata")
@@ -403,7 +399,7 @@ with form_col:
     gen = st.button("Generera offert", use_container_width=True)
     st.markdown("</div>", unsafe_allow_html=True)
 
-# Generera text
+# Generate
 if gen:
     missing = []
     for val, label in [
@@ -420,6 +416,9 @@ if gen:
     if missing:
         st.error("Fyll i: " + ", ".join(missing))
     else:
+        # ny offert-id per generering
+        st.session_state.offer_id = generate_offer_id()
+
         d = {
             "company": company.strip(),
             "contact": contact.strip(),
@@ -437,7 +436,7 @@ if gen:
             "price_total": total_price,
         }
 
-        # Om ingen nyckel / ingen OpenAI-klient => fallback-text
+        # fallback om ingen nyckel / ingen OpenAI
         if (not api_key) or (OpenAI is None):
             st.session_state.offertext = f"""# Offert för {d['job_type']}
 
@@ -483,7 +482,6 @@ Vänliga hälsningar,
         else:
             client = OpenAI(api_key=api_key)
             prompt = build_prompt(d)
-
             try:
                 with st.spinner("AI skriver offerten…"):
                     resp = client.chat.completions.create(
@@ -502,6 +500,7 @@ Vänliga hälsningar,
 
         st.session_state.meta = {"jobb": d["job_type"], "kund": d["customer"], "datum": d["date"]}
 
+# Output
 with out_col:
     st.markdown('<div class="card">', unsafe_allow_html=True)
     st.subheader("Färdig offert")
@@ -517,27 +516,28 @@ with out_col:
 
         meta = st.session_state.meta or {}
         fname_base = f"offert_{safe_filename(meta.get('jobb','jobb'))}_{safe_filename(meta.get('kund','kund'))}_{meta.get('datum','')}"
-
         customer_logo_bytes = customer_logo_file.read() if customer_logo_file else None
 
-        # Premium PDF
+        # Använd formulärdata om finns, annars tomt (så demo inte kraschar)
+        pdf_data = {
+            "company": (company or "").strip(),
+            "contact": (contact or "").strip(),
+            "customer": (customer or "").strip(),
+            "location": (location or "").strip(),
+            "job_type": (job_type or "").strip(),
+            "size": (size or "").strip(),
+            "material": (material or "").strip(),
+            "date": date_str,
+            "offer_id": st.session_state.offer_id,
+            "price_work": int(price_work),
+            "price_material": int(price_material),
+            "price_other": int(price_other),
+            "price_total": int(total_price),
+        }
+
         pdf_buffer = generate_pdf_premium(
             offer_md=offertext,
-            data={
-                "company": company.strip(),
-                "contact": contact.strip(),
-                "customer": customer.strip(),
-                "location": location.strip(),
-                "job_type": job_type.strip(),
-                "size": size.strip(),
-                "material": material.strip(),
-                "date": date_str,
-                "offer_id": st.session_state.offer_id,
-                "price_work": int(price_work),
-                "price_material": int(price_material),
-                "price_other": int(price_other),
-                "price_total": int(total_price),
-            },
+            data=pdf_data,
             customer_logo_bytes=customer_logo_bytes,
         )
 
@@ -558,6 +558,8 @@ with out_col:
         )
 
     st.markdown("</div>", unsafe_allow_html=True)
+
+
 
 
 
