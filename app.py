@@ -1,11 +1,15 @@
-st.image("logo.png", width=180)
 import os
 import re
-from datetime import datetime
+from datetime import date
 from io import BytesIO
 
 import streamlit as st
-from openai import OpenAI
+
+# OpenAI (nya klienten) - valfri, appen funkar även utan
+try:
+    from openai import OpenAI
+except Exception:
+    OpenAI = None
 
 from reportlab.lib.pagesizes import A4
 from reportlab.pdfgen import canvas
@@ -16,6 +20,7 @@ from reportlab.lib.units import mm
 # Helpers
 # -----------------------------
 def load_api_key_from_env_file(path=".env"):
+    """Minimal .env-läsare (key=value)"""
     if not os.path.exists(path):
         return
     with open(path, "r", encoding="utf-8") as f:
@@ -24,7 +29,23 @@ def load_api_key_from_env_file(path=".env"):
             if not line or line.startswith("#") or "=" not in line:
                 continue
             k, v = line.split("=", 1)
-            os.environ.setdefault(k.strip(), v.strip())
+            os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
+
+
+def get_api_key():
+    """Läs från Streamlit Secrets (Cloud) eller från miljö/.env (lokalt)."""
+    # 1) Streamlit secrets
+    try:
+        if hasattr(st, "secrets") and "OPENAI_API_KEY" in st.secrets:
+            v = str(st.secrets["OPENAI_API_KEY"]).strip()
+            return v or None
+    except Exception:
+        pass
+
+    # 2) .env + env var
+    load_api_key_from_env_file()
+    v = os.getenv("OPENAI_API_KEY", "").strip()
+    return v or None
 
 
 def safe_filename(s: str) -> str:
@@ -55,11 +76,9 @@ def offer_to_pdf_bytes(title: str, body: str) -> bytes:
         c.setFont("Helvetica", 10)
         y = height - 18 * mm
 
-    # Enkel radbrytning och sidbryt
+    # Enkel radbrytning & sidbryt
     for raw_line in body.splitlines():
         line = raw_line.replace("\t", "    ")
-
-        # wrap lite mjukt
         while len(line) > 110:
             c.drawString(x, y, line[:110])
             y -= line_height
@@ -109,10 +128,64 @@ Skriv kortfattat och tydligt.
 """
 
 
+def fallback_offer(d: dict) -> str:
+    """Om API-nyckel saknas eller är fel, generera en enkel men proffsig offert utan AI."""
+    return f"""# Offert – {d['jobb']}
+
+**Företag:** {d['foretagsnamn']}  
+**Kontakt:** {d['kontaktinfo']}  
+**Datum:** {d['datum']}  
+**Kund:** {d['kund']}  
+**Plats/ort:** {d['plats']}  
+
+---
+
+## Projektbeskrivning
+Denna offert avser **{d['jobb']}** i **{d['plats']}**. Omfattning: **{d['storlek']}**.  
+Material: **{d['material']}**.  
+Kommentar/önskemål: {d['kommentar'] or "—"}
+
+## Arbetsmoment
+- Förberedelse och skydd av ytor
+- Rivning / demontering (vid behov)
+- Byggnation / montering enligt överenskommelse
+- Finjustering, kontroll och städning
+- Slutbesiktning med kund
+
+## Material
+- Standardmaterial enligt överenskommelse
+- Skruv/fästelement
+- Eventuella tillbehör enligt behov
+
+## Tidsplan
+- Uppskattad tid: **enl. överenskommelse** (påverkas av tillgång på material och eventuella tillägg)
+
+## Pris
+- Arbete: **— SEK**
+- Material: **— SEK**
+- Övrigt (transport/avfall): **— SEK**
+- **Totalpris inkl. moms:** **— SEK**
+
+## Villkor
+1. Offerten gäller i 30 dagar från datumet ovan.  
+2. Betalning 30 dagar efter slutfört arbete, om inget annat avtalats.  
+3. Tilläggsarbete debiteras enligt överenskommelse.  
+4. Startdatum enligt överenskommelse.  
+5. Ändringar kan påverka pris och tidsplan.  
+
+## Kontakt
+Vid frågor eller ändringar, kontakta oss.
+
+Vänliga hälsningar,  
+**{d['foretagsnamn']}**  
+{d['kontaktinfo']}
+"""
+
+
 # -----------------------------
 # App setup
 # -----------------------------
-st.set_page_config(page_title="AI-offertgenerator", page_icon="🧱", layout="wide")
+st.set_page_config(page_title="Offertly", page_icon="📄", layout="wide")
 
 st.markdown(
     """
@@ -132,27 +205,55 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-load_api_key_from_env_file()
-api_key = os.getenv("OPENAI_API_KEY")
-if not api_key:
-    st.error("Hittar ingen OPENAI_API_KEY i .env i C:\\ai-offert. Lägg in nyckeln och starta om appen.")
-    st.stop()
+api_key = get_api_key()
 
-client = OpenAI(api_key=api_key)
+# init OpenAI client only if possible
+client = None
+if api_key and OpenAI is not None:
+    try:
+        client = OpenAI(api_key=api_key)
+    except Exception:
+        client = None
+
+# -----------------------------
+# Sidebar
+# -----------------------------
+with st.sidebar:
+    st.title("📄 Offertly")
+    st.caption("Skapa en offert på sekunder.")
+
+    if os.path.exists("logo.png"):
+        st.image("logo.png", use_container_width=True)
+
+    st.divider()
+
+    if api_key:
+        st.success("OPENAI_API_KEY hittad")
+    else:
+        st.warning("Ingen OPENAI_API_KEY hittad (fallback-mall används).")
+        st.caption('Lägg nyckeln i Streamlit Secrets som:\n\nOPENAI_API_KEY = "sk-..."')
+
+    st.divider()
+    st.caption("Tips: Kundens logo kan laddas upp och användas i PDF (steg 2).")
+
+
+# -----------------------------
+# State
+# -----------------------------
+if "offertext" not in st.session_state:
+    st.session_state.offertext = ""
+if "meta" not in st.session_state:
+    st.session_state.meta = {}
+
 
 # -----------------------------
 # UI
 # -----------------------------
-with st.sidebar:
-    st.title("🧱 AI-offertgenerator")
-    st.caption("Skapa en offert på sekunder.")
-    if os.path.exists("logo.png"):
-        st.image("logo.png", use_container_width=True)
-    st.divider()
-    st.caption("Tips: Lägg in företagets logga som logo.png i C:\\ai-offert")
-
-st.markdown("## AI-offertgenerator för byggföretag")
-st.markdown('<div class="muted">Fyll i uppgifterna → generera offert → ladda ner som PDF.</div>', unsafe_allow_html=True)
+st.markdown("## Offertly – AI-offertgenerator")
+st.markdown(
+    '<div class="muted">Fyll i uppgifterna → generera offert → ladda ner som PDF/.md</div>',
+    unsafe_allow_html=True,
+)
 st.write("")
 
 form_col, out_col = st.columns([1.05, 1.25], gap="large")
@@ -163,26 +264,26 @@ with form_col:
 
     c1, c2 = st.columns(2)
     with c1:
-        foretagsnamn = st.text_input("Företagsnamn", value="RivoBygg")
-        kontaktinfo = st.text_input("Kontaktinfo (tel/mejl)", value="070-000 00 00 • info@rivobygg.se")
+        foretagsnamn = st.text_input("Företagsnamn", value="")
+        kontaktinfo = st.text_input("Kontaktinfo (tel/mejl)", value="")
     with c2:
-        datum = st.date_input("Datum", value=datetime.now()).strftime("%Y-%m-%d")
-        plats = st.text_input("Plats/ort", value="Landskrona")
+        datum_val = st.date_input("Datum", value=date.today())
+        datum = datum_val.strftime("%Y-%m-%d")
+        plats = st.text_input("Plats/ort", value="")
 
-    kund = st.text_input("Kundens namn", value="Hamid")
-    jobb = st.text_input("Typ av jobb", value="Ombyggnation")
-    storlek = st.text_input("Omfattning / storlek", value="145 kvm")
-    material = st.text_input("Material", value="Standardmaterial enligt överenskommelse")
-    kommentar = st.text_area("Kommentar / önskemål (valfritt)", height=90, placeholder="T.ex. ROT, tidsönskemål, specifika material…")
+    kund = st.text_input("Kundens namn", value="")
+    jobb = st.text_input("Typ av jobb", value="")
+    storlek = st.text_input("Omfattning / storlek", value="")
+    material = st.text_input("Material", value="")
+    kommentar = st.text_area(
+        "Kommentar / önskemål (valfritt)",
+        height=90,
+        placeholder="T.ex. ROT, tidsönskemål, specifika material…",
+    )
 
     st.write("")
     gen = st.button("Generera offert", use_container_width=True)
     st.markdown("</div>", unsafe_allow_html=True)
-
-if "offertext" not in st.session_state:
-    st.session_state.offertext = ""
-if "meta" not in st.session_state:
-    st.session_state.meta = {}
 
 if gen:
     missing = []
@@ -212,25 +313,28 @@ if gen:
             "kommentar": kommentar.strip(),
         }
 
-        prompt = build_prompt(d)
-
-        with out_col:
-            st.markdown('<div class="card">', unsafe_allow_html=True)
-            st.subheader("Genererar…")
-            with st.spinner("AI skriver offerten…"):
-                resp = client.chat.completions.create(
-                    model="gpt-4o-mini",
-                    messages=[
-                        {"role": "system", "content": "Du skriver professionella svenska bygg-offerter."},
-                        {"role": "user", "content": prompt},
-                    ],
-                    temperature=0.3,
-                    max_tokens=900,
-                )
+        # Prova AI om vi har client, annars fallback
+        if client is None:
+            st.session_state.offertext = fallback_offer(d)
+        else:
+            prompt = build_prompt(d)
+            try:
+                with st.spinner("AI skriver offerten…"):
+                    resp = client.chat.completions.create(
+                        model="gpt-4o-mini",
+                        messages=[
+                            {"role": "system", "content": "Du skriver professionella svenska bygg-offerter."},
+                            {"role": "user", "content": prompt},
+                        ],
+                        temperature=0.3,
+                        max_tokens=900,
+                    )
                 st.session_state.offertext = resp.choices[0].message.content
-                st.session_state.meta = {"jobb": d["jobb"], "kund": d["kund"], "datum": d["datum"]}
-            st.success("Klart!")
-            st.markdown("</div>", unsafe_allow_html=True)
+            except Exception as e:
+                st.warning("Kunde inte använda AI-nyckeln just nu – fallback-mall används.")
+                st.session_state.offertext = fallback_offer(d)
+
+        st.session_state.meta = {"jobb": d["jobb"], "kund": d["kund"], "datum": d["datum"]}
 
 with out_col:
     st.markdown('<div class="card">', unsafe_allow_html=True)
@@ -240,8 +344,6 @@ with out_col:
         st.info("Generera en offert så dyker den upp här.")
     else:
         offertext = st.session_state.offertext
-
-        # Snygg preview
         st.markdown(offertext)
 
         st.write("")
@@ -276,7 +378,9 @@ with out_col:
         )
 
     st.markdown("</div>", unsafe_allow_html=True)
-Add logo to app
+
+
+
 
 
 
