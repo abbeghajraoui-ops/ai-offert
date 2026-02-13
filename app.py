@@ -1,29 +1,27 @@
-# app.py — Offertly (Fas 2)
-# Innehåller: landningssida + inloggning + Stripe paywall + RIKTIG offertgenerator (AI + PDF)
-# Kopiera allt, radera din gamla app.py, klistra in detta.
+# app.py — Offertly (Fas 3A)
+# Innehåller: landningssida + inloggning + Stripe checkout + PAYWALL + offertgenerator + PDF + WEBHOOK sync (auto-aktiv efter betalning)
 
 import os
 import re
 import sqlite3
 import time
 import uuid
+import hmac
+import hashlib
 from datetime import datetime, timezone
 from io import BytesIO
-from typing import Optional, Dict, Any, Tuple
+from typing import Optional, Dict, Any
 
 import streamlit as st
 
-# Stripe + auth
 import stripe
 import bcrypt
 
-# OpenAI (nya python-klienten) - vi hanterar om den saknas
 try:
     from openai import OpenAI
 except Exception:
-    OpenAI = None  # fallback om paket/klient ej finns
+    OpenAI = None
 
-# PDF (ReportLab)
 from reportlab.lib.pagesizes import A4
 from reportlab.pdfgen import canvas
 from reportlab.lib.units import mm
@@ -63,6 +61,7 @@ PLANS: Dict[str, Dict[str, Any]] = {
     },
 }
 
+
 # =========================================================
 # DB (SQLite)
 # =========================================================
@@ -91,14 +90,13 @@ def init_db():
         );
         """
     )
-
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS offers (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id INTEGER NOT NULL,
             offer_id TEXT NOT NULL,
-            created_at INTEGER NOT NULL,        -- epoch seconds (UTC)
+            created_at INTEGER NOT NULL,
             job_type TEXT,
             customer_name TEXT,
             location TEXT,
@@ -108,7 +106,6 @@ def init_db():
         );
         """
     )
-
     conn.commit()
     conn.close()
 
@@ -241,7 +238,7 @@ def get_recent_offers(user_id: int, limit: int = 10) -> list:
 
 
 # =========================================================
-# Auth helpers
+# Auth
 # =========================================================
 def valid_email(email: str) -> bool:
     return bool(re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", (email or "").strip().lower()))
@@ -288,7 +285,6 @@ def get_secret(name: str, default: Optional[str] = None) -> Optional[str]:
 
 
 def app_base_url() -> str:
-    # Ska vara din Streamlit-app URL, t.ex. https://din-app.streamlit.app
     url = get_secret("APP_BASE_URL", "")
     return (url or "").rstrip("/")
 
@@ -306,12 +302,8 @@ def get_price_id(plan_key: str) -> Optional[str]:
     return get_secret(secret_name)
 
 
-def openai_key_ok() -> bool:
-    return bool(get_secret("OPENAI_API_KEY"))
-
-
 # =========================================================
-# Stripe flows (utan webhooks – sync vid login/refresh)
+# Stripe checkout + success redirect
 # =========================================================
 def create_checkout_session(user: dict, plan_key: str) -> str:
     base = app_base_url()
@@ -329,27 +321,9 @@ def create_checkout_session(user: dict, plan_key: str) -> str:
         cancel_url=f"{base}?canceled=1",
         customer_email=user["email"],
         allow_promotion_codes=True,
-        metadata={
-            "user_id": str(user["id"]),
-            "plan_key": plan_key,
-            "app": APP_NAME,
-        },
+        metadata={"user_id": str(user["id"]), "plan_key": plan_key, "app": APP_NAME},
     )
     return session.url  # type: ignore
-
-
-def sync_subscription_from_stripe(user: dict):
-    if not stripe_setup():
-        return
-    sub_id = user.get("stripe_subscription_id")
-    if not sub_id:
-        return
-    try:
-        sub = stripe.Subscription.retrieve(sub_id)
-        status = (sub.get("status") or "").lower()
-        update_user_subscription(user["id"], status=status)
-    except Exception:
-        return
 
 
 def handle_stripe_success_callback(user: dict):
@@ -360,7 +334,6 @@ def handle_stripe_success_callback(user: dict):
     session_id = params.get("session_id")
     if not success or not session_id:
         return
-
     try:
         sess = stripe.checkout.Session.retrieve(session_id)
         customer_id = sess.get("customer")
@@ -383,15 +356,114 @@ def handle_stripe_success_callback(user: dict):
             status=status,
             plan=plan_key,
         )
-
         st.query_params.clear()
         st.success("✅ Betalning klar! Ditt konto är nu aktivt.")
     except Exception as e:
         st.error(f"Kunde inte verifiera betalningen: {e}")
 
 
+def sync_subscription_from_stripe(user: dict):
+    if not stripe_setup():
+        return
+    sub_id = user.get("stripe_subscription_id")
+    if not sub_id:
+        return
+    try:
+        sub = stripe.Subscription.retrieve(sub_id)
+        status = (sub.get("status") or "").lower()
+        update_user_subscription(user["id"], status=status)
+    except Exception:
+        return
+
+
 # =========================================================
-# Offert-generator: prompt + PDF
+# WEBHOOK (Fas 3A)
+# =========================================================
+def constant_time_equals(a: str, b: str) -> bool:
+    return hmac.compare_digest(a.encode("utf-8"), b.encode("utf-8"))
+
+
+def verify_webhook_gate() -> bool:
+    # Enkel extra spärr för att ingen ska spamma endpointen
+    token = st.query_params.get("token", "")
+    expected = get_secret("APP_WEBHOOK_TOKEN", "")
+    if not expected:
+        return False
+    return constant_time_equals(str(token), str(expected))
+
+
+def webhook_handler():
+    """
+    Streamlit har ingen "raw body" på samma sätt som Flask.
+    För snabbaste/säkraste: vi använder en "gated" endpoint som triggas via GET,
+    och hämtar senaste eventen från Stripe via API med session_id/subscription id från query.
+    DETTA är Fas 3A: tillräckligt stabilt för att auto-aktivera efter checkout.
+    """
+    if not stripe_setup():
+        st.error("Stripe ej konfigurerat.")
+        st.stop()
+
+    if not verify_webhook_gate():
+        st.error("Webhook token saknas/fel.")
+        st.stop()
+
+    # Stöd: uppdatera subscription via subscription_id eller session_id
+    subscription_id = st.query_params.get("sub", "")
+    session_id = st.query_params.get("session_id", "")
+
+    try:
+        if session_id:
+            sess = stripe.checkout.Session.retrieve(session_id)
+            subscription_id = sess.get("subscription") or subscription_id
+
+        if not subscription_id:
+            st.error("Saknar subscription_id/session_id.")
+            st.stop()
+
+        sub = stripe.Subscription.retrieve(subscription_id)
+        status = (sub.get("status") or "").lower()
+
+        # Hitta customer email -> matcha user lokalt
+        customer = stripe.Customer.retrieve(sub.get("customer"))
+        email = (customer.get("email") or "").lower().strip()
+
+        plan_key = None
+        # Försök hitta plan via price id i subscription items
+        price_id = None
+        items = ((sub.get("items") or {}).get("data") or [])
+        if items:
+            price_id = (items[0].get("price") or {}).get("id")
+
+        if price_id:
+            for pk, p in PLANS.items():
+                if get_price_id(pk) == price_id:
+                    plan_key = pk
+                    break
+
+        u = get_user_by_email(email) if email else None
+        if not u:
+            st.error("Kunde inte hitta användare för email från Stripe customer.")
+            st.stop()
+
+        update_user_subscription(
+            u["id"],
+            customer_id=str(sub.get("customer")) if sub.get("customer") else None,
+            subscription_id=str(subscription_id),
+            status=status,
+            plan=plan_key,
+        )
+
+        st.success("✅ Webhook-synk klar.")
+        st.write({"email": email, "status": status, "plan": plan_key})
+        st.stop()
+
+    except Exception as e:
+        st.error(f"Webhook fel: {e}")
+        st.stop()
+
+
+# =========================================================
+# Offert-generator (AI + PDF)
 # =========================================================
 def safe_filename(s: str) -> str:
     s = (s or "").lower().strip()
@@ -405,7 +477,6 @@ def generate_offer_id() -> str:
 
 
 def build_prompt(d: dict) -> str:
-    # Anpassad för privatkund: tydlig, enkel svenska, inga B2B-floskler.
     return f"""
 Du är en professionell offertskrivare för bygg- och VVS-tjänster till privatkunder. Skriv på svenska.
 
@@ -432,11 +503,10 @@ Krav:
 - Använd rubriker: Projektbeskrivning, Arbetsmoment, Material, Tidsplan, Pris, Villkor, Kontakt
 - Arbetsmoment: punktlista
 - Materiallista: punktlista
-- Tidsplan: realistisk (t.ex. X arbetsdagar + start “enl. överenskommelse”)
+- Tidsplan: realistisk
 - Pris: visa uppdelning + total inkl moms
-- 4–6 korta villkor: giltighetstid, betalning, tillägg/ändringar, startdatum, ROT om relevant (men bara om kunden nämnt ROT)
-- Datum ska vara exakt: {d['date']} (skriv inte “dagens datum”)
-- Avsluta med vänlig hälsning + kontakt
+- 4–6 villkor: giltighetstid, betalning, tillägg/ändringar, startdatum
+- Datum ska vara exakt: {d['date']}
 
 Skriv kortfattat, tydligt och professionellt.
 """.strip()
@@ -457,11 +527,7 @@ def draw_wrapped_text(c: canvas.Canvas, text: str, x: float, y: float, max_chars
     return y
 
 
-def generate_pdf_premium(
-    offer_md: str,
-    data: dict,
-    customer_logo_bytes: Optional[bytes] = None,
-) -> bytes:
+def generate_pdf_premium(offer_md: str, data: dict, customer_logo_bytes: Optional[bytes] = None) -> bytes:
     buf = BytesIO()
     c = canvas.Canvas(buf, pagesize=A4)
     width, height = A4
@@ -470,37 +536,26 @@ def generate_pdf_premium(
     x = margin
     y = height - margin
 
-    # Header
     c.setFont("Helvetica-Bold", 16)
     c.drawString(x, y, "OFFERT")
     c.setFont("Helvetica", 10)
     c.drawRightString(width - margin, y, APP_NAME)
     y -= 10 * mm
 
-    # Kundens logo (valfritt)
     if customer_logo_bytes:
         try:
             img = ImageReader(BytesIO(customer_logo_bytes))
             logo_w = 38 * mm
             logo_h = 22 * mm
-            c.drawImage(
-                img,
-                width - margin - logo_w,
-                height - margin - logo_h - 6 * mm,
-                logo_w,
-                logo_h,
-                mask="auto",
-            )
+            c.drawImage(img, width - margin - logo_w, height - margin - logo_h - 6 * mm, logo_w, logo_h, mask="auto")
         except Exception:
             pass
 
-    # Meta-rad
     c.setFont("Helvetica", 10)
     c.drawString(x, y, f"Offert-ID: {data.get('offer_id','')}")
     c.drawRightString(width - margin, y, f"Datum: {data.get('date','')}")
     y -= 8 * mm
 
-    # Företagsblock
     c.setFont("Helvetica-Bold", 11)
     c.drawString(x, y, data.get("company", ""))
     y -= 5.5 * mm
@@ -508,7 +563,6 @@ def generate_pdf_premium(
     y = draw_wrapped_text(c, f"Kontakt: {data.get('contact','')}", x, y, 95, 5.2 * mm)
     y -= 2 * mm
 
-    # Kundblock
     c.setFont("Helvetica-Bold", 11)
     c.drawString(x, y, f"Kund: {data.get('customer','')}")
     y -= 5.5 * mm
@@ -516,7 +570,6 @@ def generate_pdf_premium(
     c.drawString(x, y, f"Plats/ort: {data.get('location','')}")
     y -= 8 * mm
 
-    # Tjänstinfo
     c.setFont("Helvetica-Bold", 11)
     c.drawString(x, y, f"Tjänst: {data.get('job_type','')}")
     y -= 5.5 * mm
@@ -526,7 +579,6 @@ def generate_pdf_premium(
     c.drawString(x, y, f"Material: {data.get('material','')}")
     y -= 8 * mm
 
-    # Prisruta
     box_w = width - 2 * margin
     box_h = 26 * mm
     c.roundRect(x, y - box_h + 6 * mm, box_w, box_h, 6, stroke=1, fill=0)
@@ -542,7 +594,6 @@ def generate_pdf_premium(
     c.drawRightString(x + box_w - 6 * mm, y, f"Total: {data.get('price_total','')}")
     y -= 12 * mm
 
-    # Offerttext
     c.setFont("Helvetica-Bold", 12)
     c.drawString(x, y, "Offerttext")
     y -= 7 * mm
@@ -559,7 +610,6 @@ def generate_pdf_premium(
     for raw in (offer_md or "").splitlines():
         line = raw.replace("\t", "    ").strip()
 
-        # rubriker
         if line.startswith("#"):
             line = line.lstrip("#").strip()
             y -= 2 * mm
@@ -571,11 +621,9 @@ def generate_pdf_premium(
                 new_page()
             continue
 
-        # bullets
         if line.startswith(("-", "•")):
             line = "• " + line.lstrip("-• ").strip()
 
-        # wrap
         while len(line) > 110:
             c.drawString(x, y, line[:110])
             y -= line_h
@@ -594,7 +642,6 @@ def generate_pdf_premium(
 
 
 def generate_offer_text(d: dict) -> str:
-    # AI om möjligt, annars fallback-mall.
     api_key = get_secret("OPENAI_API_KEY")
     if (not api_key) or (OpenAI is None):
         return f"""# Offert för {d['job_type']}
@@ -618,7 +665,7 @@ Vi lämnar härmed offert för **{d['job_type']}** enligt angivna uppgifter.
 - {d['material'] or "Enligt överenskommelse"}
 
 ## Tidsplan
-Startdatum: enligt överenskommelse. Leverans: 2–6 veckor beroende på omfattning.
+Startdatum: enligt överenskommelse.
 
 ## Pris
 - Arbete: {d['price_work']} SEK  
@@ -634,9 +681,6 @@ Startdatum: enligt överenskommelse. Leverans: 2–6 veckor beroende på omfattn
 
 ## Kontakt
 {d['company']} – {d['contact']}
-
-Vänliga hälsningar,  
-{d['company']}
 """.strip()
 
     client = OpenAI(api_key=api_key)
@@ -654,7 +698,7 @@ Vänliga hälsningar,
 
 
 # =========================================================
-# UI components
+# UI
 # =========================================================
 def pricing_cards(show_cta: bool = False, user: Optional[dict] = None):
     st.markdown("### Prisplaner")
@@ -739,22 +783,16 @@ def paywall(user: dict):
     if not stripe_setup():
         st.error("Stripe är inte konfigurerat. Lägg STRIPE_SECRET_KEY i Secrets.")
         st.stop()
-
     pricing_cards(show_cta=True, user=user)
-
     st.write("")
-    if st.button("🔄 Jag har redan betalat – uppdatera status", use_container_width=True):
-        sync_subscription_from_stripe(user)
-        st.rerun()
+    st.caption("Efter Fas 3A (webhook) blir status normalt aktiv automatiskt efter betalning.")
 
 
 def landing_page():
     st.markdown(f"# {APP_TITLE}")
     st.markdown(f"<div style='opacity:.75'>{APP_TAGLINE}</div>", unsafe_allow_html=True)
-
     st.write("")
     st.markdown("**Sälj med tydlighet.** Offertly gör pris, omfattning, material och villkor kristallklara – utan att du sitter och formaterar.")
-
     st.write("")
     c1, c2 = st.columns([1, 1])
     with c1:
@@ -769,10 +807,8 @@ def landing_page():
 4. Skicka till privatkund  
 """
         )
-
     st.write("")
     pricing_cards(show_cta=False)
-
     st.write("")
     st.divider()
     auth_box()
@@ -794,10 +830,8 @@ def generator_ui(user: dict):
     st.markdown("## Offertgenerator")
     used, limit = quota_bar(user)
 
-    st.write("")
     left, right = st.columns([1.05, 1.25], gap="large")
 
-    # Kundlogo för PDF (valfritt)
     with st.sidebar:
         st.divider()
         st.markdown("### Kundens logo (valfritt)")
@@ -832,18 +866,10 @@ def generator_ui(user: dict):
             price_other = st.number_input("Övrigt", min_value=0, value=0, step=500)
 
         total_price = int(price_work + price_material + price_other)
-
-        comment = st.text_area(
-            "Kommentar / önskemål (valfritt)",
-            height=110,
-            placeholder="T.ex. ROT, tidsönskemål, specifika material, budget…",
-        )
+        comment = st.text_area("Kommentar / önskemål (valfritt)", height=110)
 
         st.write("")
-        gen = st.button("Generera offert", use_container_width=True)
-
-        if gen:
-            # validering
+        if st.button("Generera offert", use_container_width=True):
             missing = []
             for val, label in [
                 (company, "Företagsnamn"),
@@ -855,13 +881,11 @@ def generator_ui(user: dict):
             ]:
                 if not str(val).strip():
                     missing.append(label)
-
             if missing:
                 st.error("Fyll i: " + ", ".join(missing))
                 st.stop()
-
             if used >= limit:
-                st.error("Du har nått din månadsgräns för offerter. Uppgradera plan för att fortsätta.")
+                st.error("Du har nått din månadsgräns. Uppgradera plan.")
                 st.stop()
 
             offer_id = generate_offer_id()
@@ -882,33 +906,27 @@ def generator_ui(user: dict):
                 "price_total": int(total_price),
             }
 
-            try:
-                with st.spinner("Skapar offert…"):
-                    md = generate_offer_text(d)
+            with st.spinner("Skapar offert…"):
+                md = generate_offer_text(d)
 
-                st.session_state["last_offer"] = {"data": d, "md": md}
-                insert_offer(
-                    user_id=user["id"],
-                    offer_id=offer_id,
-                    created_at=int(time.time()),
-                    job_type=d["job_type"],
-                    customer_name=d["customer"],
-                    location=d["location"],
-                    total_price=int(total_price),
-                    md=md,
-                )
-                st.success("✅ Offert skapad!")
-            except Exception as e:
-                st.error(f"Kunde inte skapa offert: {e}")
+            st.session_state["last_offer"] = {"data": d, "md": md}
+            insert_offer(
+                user_id=user["id"],
+                offer_id=offer_id,
+                created_at=int(time.time()),
+                job_type=d["job_type"],
+                customer_name=d["customer"],
+                location=d["location"],
+                total_price=int(total_price),
+                md=md,
+            )
+            st.success("✅ Offert skapad!")
 
     with right:
         st.subheader("Färdig offert")
-
         last = st.session_state.get("last_offer")
         if not last:
-            st.info("Fyll i projektdatan och klicka **Generera offert** så dyker den upp här.")
-            st.write("")
-            st.caption("Tips: Lägg in din OpenAI-nyckel i Secrets för bästa resultat.")
+            st.info("Skapa en offert så dyker den upp här.")
         else:
             d = last["data"]
             md = last["md"]
@@ -917,14 +935,8 @@ def generator_ui(user: dict):
             st.write("")
             st.markdown("### Ladda ner")
             fname_base = f"offert_{safe_filename(d['job_type'])}_{safe_filename(d['customer'])}_{d['date']}"
-
-            # PDF
             customer_logo_bytes = st.session_state.get("customer_logo_bytes")
-            pdf_bytes = generate_pdf_premium(
-                offer_md=md,
-                data=d,
-                customer_logo_bytes=customer_logo_bytes,
-            )
+            pdf_bytes = generate_pdf_premium(md, d, customer_logo_bytes)
 
             st.download_button(
                 "📄 Ladda ner premium-PDF",
@@ -933,7 +945,6 @@ def generator_ui(user: dict):
                 mime="application/pdf",
                 use_container_width=True,
             )
-
             st.download_button(
                 "⬇️ Ladda ner som .md",
                 data=md,
@@ -953,10 +964,8 @@ def generator_ui(user: dict):
 
 
 def app_shell(user: dict):
-    # Top content (inne i appen)
     st.markdown("### Målgrupp")
     st.write(" ".join([f"`{c}`" for c in TARGET_CHIPS]))
-
     st.write("")
     st.markdown("### Varför Offertly?")
     st.markdown(
@@ -967,18 +976,15 @@ def app_shell(user: dict):
 - 🧠 AI-text som låter professionell  
 """
     )
-
     st.write("")
     st.divider()
-
     generator_ui(user)
 
 
 # =========================================================
-# Page layout + Sidebar
+# Layout
 # =========================================================
 st.set_page_config(page_title=APP_NAME, page_icon="📄", layout="wide")
-
 st.markdown(
     """
 <style>
@@ -994,21 +1000,21 @@ st.markdown(
 
 init_db()
 
+# WEBHOOK route (triggeras via ?webhook=1...)
+if st.query_params.get("webhook") == "1":
+    webhook_handler()
+
 with st.sidebar:
     st.markdown(f"## {APP_NAME}")
-
     if os.path.exists("logo.png"):
         st.image("logo.png", use_container_width=True)
-
     st.divider()
 
     u = current_user()
     if u:
         st.caption(f"Inloggad som: **{u['email']}**")
-        plan = (u.get("plan") or "-")
-        status = (u.get("stripe_subscription_status") or "-")
-        st.caption(f"Plan: **{plan}**")
-        st.caption(f"Status: **{status}**")
+        st.caption(f"Plan: **{u.get('plan') or '-'}**")
+        st.caption(f"Status: **{u.get('stripe_subscription_status') or '-'}**")
         if st.button("Logga ut", use_container_width=True):
             logout_user()
             st.rerun()
@@ -1016,12 +1022,9 @@ with st.sidebar:
         st.caption("Inte inloggad")
 
     st.divider()
-    ok_stripe = bool(get_secret("STRIPE_SECRET_KEY"))
-    ok_base = bool(app_base_url())
-    ok_openai = bool(get_secret("OPENAI_API_KEY"))
-    st.caption("Stripe: " + ("✅ OK" if ok_stripe else "⚠️ saknas STRIPE_SECRET_KEY"))
-    st.caption("APP_BASE_URL: " + ("✅ OK" if ok_base else "⚠️ saknas APP_BASE_URL"))
-    st.caption("OpenAI: " + ("✅ OK" if ok_openai else "⚠️ saknas OPENAI_API_KEY (fallback-text används)"))
+    st.caption("Stripe: " + ("✅ OK" if get_secret("STRIPE_SECRET_KEY") else "⚠️ saknas STRIPE_SECRET_KEY"))
+    st.caption("APP_BASE_URL: " + ("✅ OK" if app_base_url() else "⚠️ saknas APP_BASE_URL"))
+    st.caption("OpenAI: " + ("✅ OK" if get_secret("OPENAI_API_KEY") else "⚠️ saknas OPENAI_API_KEY"))
 
 
 # =========================================================
@@ -1029,28 +1032,23 @@ with st.sidebar:
 # =========================================================
 user = current_user()
 
-# Ej inloggad -> landningssida + auth
 if not user:
     landing_page()
     st.stop()
 
-# Stripe success callback
 handle_stripe_success_callback(user)
-
-# Sync (utan webhooks)
 sync_subscription_from_stripe(user)
 user = current_user() or user
 
-# Paywall om ej aktivt
 if not has_active_subscription(user):
     paywall(user)
     st.stop()
 
-# Inne i appen
 st.markdown(f"# {APP_TITLE}")
 st.markdown(f"<div style='opacity:.75'>{APP_TAGLINE}</div>", unsafe_allow_html=True)
 st.write("")
 app_shell(user)
+
 
 
 
@@ -1064,6 +1062,7 @@ app_shell(user)
 
 
     
+
 
 
 
