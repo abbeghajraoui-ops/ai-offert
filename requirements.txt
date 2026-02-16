@@ -4,4 +4,6 @@ reportlab
 stripe
 bcrypt
 gunicorn
+flask
+
 
