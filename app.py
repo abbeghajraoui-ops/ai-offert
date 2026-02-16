@@ -1,171 +1,241 @@
 import os
 import json
-import requests
+import time
+import urllib.request
+import urllib.parse
 import streamlit as st
-from datetime import datetime
-from reportlab.lib.pagesizes import A4
-from reportlab.pdfgen import canvas
+import stripe
 from io import BytesIO
+from reportlab.pdfgen import canvas
+from reportlab.lib.pagesizes import A4
 
-# --- ENV (Streamlit secrets) ---
-BACKEND_BASE_URL = os.environ.get("BACKEND_BASE_URL", "").rstrip("/")  # ex: https://offertly-webbhook-production.up.railway.app
-SUB_PRICE_ID = os.environ.get("SUB_PRICE_ID", "")                      # samma som på Railway
-CREDITS_PRICE_ID = os.environ.get("CREDITS_PRICE_ID", "")              # samma som på Railway
+# ----------------------------
+# Secrets / config
+# ----------------------------
+def sget(key: str, default: str = "") -> str:
+    # Streamlit Cloud: st.secrets
+    try:
+        return str(st.secrets.get(key, default)).strip()
+    except Exception:
+        return str(os.environ.get(key, default)).strip()
 
+STRIPE_SECRET_KEY = sget("STRIPE_SECRET_KEY")
+APP_WEBHOOK_TOKEN = sget("APP_WEBHOOK_TOKEN")  # same as Railway
+BACKEND_BASE_URL = sget("BACKEND_BASE_URL")    # e.g. https://offertly-webbhook-production.up.railway.app
+APP_BASE_URL = sget("APP_BASE_URL")            # your Streamlit app URL (used in success/cancel)
+PRICE_STARTER = sget("STRIPE_PRICE_ID_STARTER")
+PRICE_PRO = sget("STRIPE_PRICE_ID_PRO")
+PRICE_TEAM = sget("STRIPE_PRICE_ID_TEAM")
 
+if not STRIPE_SECRET_KEY:
+    st.error("Missing STRIPE_SECRET_KEY in Streamlit Secrets")
+    st.stop()
+
+stripe.api_key = STRIPE_SECRET_KEY
+
+# ----------------------------
+# Helper: backend calls
+# ----------------------------
+def backend_get_subscription(email: str) -> dict:
+    if not BACKEND_BASE_URL:
+        return {"ok": False, "error": "BACKEND_BASE_URL missing"}
+    if not APP_WEBHOOK_TOKEN:
+        return {"ok": False, "error": "APP_WEBHOOK_TOKEN missing"}
+
+    qs = urllib.parse.urlencode({"email": email})
+    url = f"{BACKEND_BASE_URL.rstrip('/')}/api/subscription?{qs}"
+    req = urllib.request.Request(
+        url,
+        headers={"X-APP-TOKEN": APP_WEBHOOK_TOKEN},
+        method="GET",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            data = resp.read().decode("utf-8")
+            return json.loads(data)
+    except Exception as e:
+        return {"ok": False, "error": f"Backend error: {e}"}
+
+def create_customer_portal(customer_id: str) -> str | None:
+    if not customer_id:
+        return None
+    try:
+        sess = stripe.billing_portal.Session.create(
+            customer=customer_id,
+            return_url=APP_BASE_URL or "https://streamlit.io",
+        )
+        return sess.url
+    except Exception:
+        return None
+
+# ----------------------------
+# Offer / PDF helpers
+# ----------------------------
+def generate_offer_text(company: str, customer: str, description: str) -> str:
+    # Robust, no external dependency required
+    # (You can later plug in OpenAI, but this always works.)
+    now = time.strftime("%Y-%m-%d")
+    return f"""OFFERT – {now}
+
+Företag: {company}
+Kund: {customer}
+
+Projektbeskrivning:
+{description}
+
+Förslag på upplägg:
+- Planering & genomgång på plats
+- Material & etablering
+- Utförande enligt överenskommelse
+- Avstämning och slutkontroll
+
+Pris:
+Pris fastställs efter platsbesök / kompletterande underlag.
+
+Villkor:
+- Offerten gäller i 14 dagar
+- Betalningsvillkor: 10 dagar
+- Eventuella tillägg debiteras enligt godkännande
+
+Kontakt:
+{company}
+"""
+
+def pdf_bytes_from_text(title: str, text: str) -> bytes:
+    buffer = BytesIO()
+    c = canvas.Canvas(buffer, pagesize=A4)
+    width, height = A4
+    x = 50
+    y = height - 60
+
+    c.setFont("Helvetica-Bold", 16)
+    c.drawString(x, y, title)
+    y -= 30
+
+    c.setFont("Helvetica", 11)
+
+    for line in text.splitlines():
+        if y < 60:
+            c.showPage()
+            c.setFont("Helvetica", 11)
+            y = height - 60
+        c.drawString(x, y, line[:120])
+        y -= 16
+
+    c.save()
+    buffer.seek(0)
+    return buffer.read()
+
+# ----------------------------
+# UI
+# ----------------------------
 st.set_page_config(page_title="Offertly", layout="wide")
 
 st.title("Offertly – offertmotor för bygg & VVS")
-st.caption("Skapa en proffsig offert på under 60 sekunder.")
+st.caption("Välj paket, betala och skapa offerter (PDF).")
 
-if not BACKEND_BASE_URL:
-    st.error("BACKEND_BASE_URL saknas i Streamlit secrets. Lägg till den först.")
-    st.stop()
-
-
-def backend_get_user(email: str):
-    r = requests.get(f"{BACKEND_BASE_URL}/api/user", params={"email": email}, timeout=20)
-    r.raise_for_status()
-    return r.json()
-
-
-def backend_create_checkout(email: str, mode: str, price_id: str, credits_to_add: int = 0):
-    payload = {
-        "email": email,
-        "mode": mode,
-        "price_id": price_id,
-        "credits_to_add": credits_to_add
-    }
-    r = requests.post(f"{BACKEND_BASE_URL}/api/create-checkout-session", json=payload, timeout=30)
-    r.raise_for_status()
-    return r.json()["url"]
-
-
-def backend_consume_credit(email: str, amount: int = 1):
-    r = requests.post(f"{BACKEND_BASE_URL}/api/consume-credit", json={"email": email, "amount": amount}, timeout=20)
-    if r.status_code == 200:
-        return r.json()
-    return r.json()
-
-
-def make_simple_pdf(company: str, customer: str, description: str, total_sek: int = 0) -> bytes:
-    buf = BytesIO()
-    c = canvas.Canvas(buf, pagesize=A4)
-    w, h = A4
-
-    c.setFont("Helvetica-Bold", 18)
-    c.drawString(50, h - 60, "OFFERT")
-
-    c.setFont("Helvetica", 11)
-    c.drawString(50, h - 95, f"Företag: {company}")
-    c.drawString(50, h - 115, f"Kund: {customer}")
-    c.drawString(50, h - 135, f"Datum: {datetime.now().strftime('%Y-%m-%d')}")
-
-    c.setFont("Helvetica-Bold", 12)
-    c.drawString(50, h - 170, "Beskrivning")
-    c.setFont("Helvetica", 11)
-    text = c.beginText(50, h - 190)
-    for line in (description or "").splitlines():
-        text.textLine(line)
-    c.drawText(text)
-
-    c.setFont("Helvetica-Bold", 12)
-    c.drawString(50, 120, "Summa (SEK)")
-    c.setFont("Helvetica", 12)
-    c.drawString(50, 100, f"{total_sek:,}".replace(",", " "))
-
-    c.setFont("Helvetica", 9)
-    c.drawString(50, 60, "Offertly – genererad offert (MVP).")
-    c.showPage()
-    c.save()
-    return buf.getvalue()
-
-
-# --- Sidebar login ---
 with st.sidebar:
-    st.image("logo.png", width=160) if os.path.exists("logo.png") else st.write("Offertly")
-    st.write("---")
-    email = st.text_input("Logga in med din email", placeholder="du@firma.se").strip().lower()
+    st.subheader("Inloggning")
+    email = st.text_input("Email", placeholder="din@email.se").strip().lower()
+    st.divider()
 
-    if email:
-        try:
-            user = backend_get_user(email)
-        except Exception as e:
-            st.error(f"Kunde inte läsa status från backend: {e}")
-            st.stop()
+    # Basic diagnostics
+    st.caption("Status (debug)")
+    st.write("Stripe:", "✅" if STRIPE_SECRET_KEY else "❌")
+    st.write("BACKEND_BASE_URL:", "✅" if BACKEND_BASE_URL else "❌")
+    st.write("APP_BASE_URL:", "✅" if APP_BASE_URL else "❌")
+    st.write("Price IDs:", "✅" if (PRICE_STARTER and PRICE_PRO and PRICE_TEAM) else "❌")
 
-        st.write(f"Inloggad som: **{email}**")
-        st.write(f"Plan: **{'pro' if user.get('subscription_active') else 'credits' if user.get('credits',0)>0 else 'free'}**")
-        st.write(f"Credits: **{user.get('credits',0)}**")
-        st.write(f"Abonnemang aktivt: **{user.get('subscription_active')}**")
-
-        st.write("---")
-        st.subheader("Köp")
-
-        colA, colB = st.columns(2)
-
-        with colA:
-            st.caption("Pro (abonnemang) – obegränsat")
-            if st.button("Starta Pro-abonnemang", use_container_width=True, disabled=not bool(SUB_PRICE_ID)):
-                url = backend_create_checkout(email, mode="subscription", price_id=SUB_PRICE_ID)
-                st.link_button("Öppna betalning", url, use_container_width=True)
-
-        with colB:
-            st.caption("Credits (engångsköp) – t.ex. 10 offerter")
-            if st.button("Köp 10 credits", use_container_width=True, disabled=not bool(CREDITS_PRICE_ID)):
-                url = backend_create_checkout(email, mode="payment", price_id=CREDITS_PRICE_ID, credits_to_add=10)
-                st.link_button("Öppna betalning", url, use_container_width=True)
-
-        st.write("---")
-        st.caption("Status-check")
-        if st.button("Uppdatera status", use_container_width=True):
-            st.rerun()
-    else:
-        st.info("Skriv din email för att fortsätta.")
-        st.stop()
-
-
-# --- Main app (offertgenerator) ---
-st.header("Offertgenerator")
-
-company = st.text_input("Företagsnamn", value="")
-customer = st.text_input("Kundens namn", value="")
-desc = st.text_area("Beskrivning", height=140, placeholder="Ex: totalrenovering badrum, 6 kvm...")
-
-# Refresh status in main too
-user = backend_get_user(email)
-sub_active = bool(user.get("subscription_active"))
-credits = int(user.get("credits") or 0)
-can_generate = sub_active or credits > 0
-
-if not can_generate:
-    st.warning("Du behöver **Pro-abonnemang** eller **credits** för att generera offerter.")
+if not email:
+    st.info("Skriv din email för att fortsätta.")
     st.stop()
 
-if st.button("Generera offert (AI)", use_container_width=True):
-    # 1) If credits mode => consume 1 credit
-    if not sub_active:
-        res = backend_consume_credit(email, amount=1)
-        if not res.get("ok"):
-            st.error("Inga credits kvar. Köp credits eller starta Pro.")
+sub = backend_get_subscription(email)
+if not sub.get("ok"):
+    st.error(sub.get("error", "Okänt fel när appen försökte kontakta backend."))
+    st.stop()
+
+active = bool(sub.get("active"))
+status = sub.get("status", "")
+
+col1, col2 = st.columns([2, 1], gap="large")
+
+with col2:
+    st.subheader("Abonnemang")
+    if active:
+        st.success(f"Aktiv ({status})")
+        portal_url = create_customer_portal(sub.get("customer_id", ""))
+        if portal_url:
+            st.link_button("Hantera abonnemang", portal_url)
+    else:
+        st.warning("Inte aktivt")
+
+with col1:
+    if not active:
+        st.subheader("Välj paket & betala")
+
+        plans = {
+            "Starter": PRICE_STARTER,
+            "Pro": PRICE_PRO,
+            "Team": PRICE_TEAM,
+        }
+        plan_name = st.radio("Paket", list(plans.keys()), horizontal=True)
+        chosen_price = plans[plan_name]
+
+        if not chosen_price:
+            st.error("Saknar Price ID i Secrets för valt paket.")
             st.stop()
 
-    # 2) Generate a simple, stable PDF (du kan byta till AI senare)
-    pdf_bytes = make_simple_pdf(
-        company=company or "Ditt företag",
-        customer=customer or "Kund",
-        description=desc or "Beskrivning saknas.",
-        total_sek=0
-    )
+        if st.button("Gå till Stripe Checkout", type="primary"):
+            if not APP_BASE_URL:
+                st.error("APP_BASE_URL saknas i Streamlit Secrets (behövs för success/cancel).")
+                st.stop()
 
-    st.success("Offert skapad!")
-    st.download_button(
-        "Ladda ner PDF",
-        data=pdf_bytes,
-        file_name="offertly-offert.pdf",
-        mime="application/pdf",
-        use_container_width=True
-    )
+            try:
+                checkout = stripe.checkout.Session.create(
+                    mode="subscription",
+                    customer_email=email,
+                    line_items=[{"price": chosen_price, "quantity": 1}],
+                    success_url=f"{APP_BASE_URL}?success=1&session_id={{CHECKOUT_SESSION_ID}}",
+                    cancel_url=f"{APP_BASE_URL}?canceled=1",
+                    allow_promotion_codes=True,
+                )
+                st.success("Checkout skapad!")
+                st.link_button("Öppna betalning", checkout.url)
+                st.caption("Efter betalning uppdateras din status via webhook (kan ta några sekunder).")
+            except Exception as e:
+                st.error(f"Kunde inte skapa Checkout: {e}")
+
+        st.divider()
+        st.subheader("Efter betalning")
+        st.write("Tryck här om du vill uppdatera status manuellt:")
+        if st.button("Uppdatera abonnemangstatus"):
+            st.rerun()
+
+    else:
+        st.subheader("Offertgenerator")
+
+        company = st.text_input("Företagsnamn", value="", placeholder="Ex: Bygg & VVS AB")
+        customer = st.text_input("Kundens namn", value="", placeholder="Ex: Anna Andersson")
+        description = st.text_area("Beskrivning", value="", height=160, placeholder="Ex: totalrenovering badrum...")
+
+        if st.button("Generera offert (PDF)", type="primary"):
+            if not company or not customer or not description:
+                st.error("Fyll i företagsnamn, kundens namn och beskrivning.")
+                st.stop()
+
+            text = generate_offer_text(company, customer, description)
+            pdf = pdf_bytes_from_text("Offertly – Offert", text)
+
+            st.success("Offert klar!")
+            st.text_area("Förhandsvisning (text)", value=text, height=220)
+            st.download_button(
+                "Ladda ner PDF",
+                data=pdf,
+                file_name=f"offert_{customer.replace(' ', '_')}.pdf",
+                mime="application/pdf",
+            )
+
 
 
 
@@ -184,6 +254,7 @@ if st.button("Generera offert (AI)", use_container_width=True):
 
 
     
+
 
 
 
