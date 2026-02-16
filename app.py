@@ -1,240 +1,163 @@
 import os
-import json
-import time
-import urllib.request
-import urllib.parse
+import requests
 import streamlit as st
-import stripe
-from io import BytesIO
-from reportlab.pdfgen import canvas
-from reportlab.lib.pagesizes import A4
 
-# ----------------------------
-# Secrets / config
-# ----------------------------
-def sget(key: str, default: str = "") -> str:
-    # Streamlit Cloud: st.secrets
-    try:
-        return str(st.secrets.get(key, default)).strip()
-    except Exception:
-        return str(os.environ.get(key, default)).strip()
-
-STRIPE_SECRET_KEY = sget("STRIPE_SECRET_KEY")
-APP_WEBHOOK_TOKEN = sget("APP_WEBHOOK_TOKEN")  # same as Railway
-BACKEND_BASE_URL = sget("BACKEND_BASE_URL")    # e.g. https://offertly-webbhook-production.up.railway.app
-APP_BASE_URL = sget("APP_BASE_URL")            # your Streamlit app URL (used in success/cancel)
-PRICE_STARTER = sget("STRIPE_PRICE_ID_STARTER")
-PRICE_PRO = sget("STRIPE_PRICE_ID_PRO")
-PRICE_TEAM = sget("STRIPE_PRICE_ID_TEAM")
-
-if not STRIPE_SECRET_KEY:
-    st.error("Missing STRIPE_SECRET_KEY in Streamlit Secrets")
-    st.stop()
-
-stripe.api_key = STRIPE_SECRET_KEY
-
-# ----------------------------
-# Helper: backend calls
-# ----------------------------
-def backend_get_subscription(email: str) -> dict:
-    if not BACKEND_BASE_URL:
-        return {"ok": False, "error": "BACKEND_BASE_URL missing"}
-    if not APP_WEBHOOK_TOKEN:
-        return {"ok": False, "error": "APP_WEBHOOK_TOKEN missing"}
-
-    qs = urllib.parse.urlencode({"email": email})
-    url = f"{BACKEND_BASE_URL.rstrip('/')}/api/subscription?{qs}"
-    req = urllib.request.Request(
-        url,
-        headers={"X-APP-TOKEN": APP_WEBHOOK_TOKEN},
-        method="GET",
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=20) as resp:
-            data = resp.read().decode("utf-8")
-            return json.loads(data)
-    except Exception as e:
-        return {"ok": False, "error": f"Backend error: {e}"}
-
-def create_customer_portal(customer_id: str) -> str | None:
-    if not customer_id:
-        return None
-    try:
-        sess = stripe.billing_portal.Session.create(
-            customer=customer_id,
-            return_url=APP_BASE_URL or "https://streamlit.io",
-        )
-        return sess.url
-    except Exception:
-        return None
-
-# ----------------------------
-# Offer / PDF helpers
-# ----------------------------
-def generate_offer_text(company: str, customer: str, description: str) -> str:
-    # Robust, no external dependency required
-    # (You can later plug in OpenAI, but this always works.)
-    now = time.strftime("%Y-%m-%d")
-    return f"""OFFERT – {now}
-
-Företag: {company}
-Kund: {customer}
-
-Projektbeskrivning:
-{description}
-
-Förslag på upplägg:
-- Planering & genomgång på plats
-- Material & etablering
-- Utförande enligt överenskommelse
-- Avstämning och slutkontroll
-
-Pris:
-Pris fastställs efter platsbesök / kompletterande underlag.
-
-Villkor:
-- Offerten gäller i 14 dagar
-- Betalningsvillkor: 10 dagar
-- Eventuella tillägg debiteras enligt godkännande
-
-Kontakt:
-{company}
-"""
-
-def pdf_bytes_from_text(title: str, text: str) -> bytes:
-    buffer = BytesIO()
-    c = canvas.Canvas(buffer, pagesize=A4)
-    width, height = A4
-    x = 50
-    y = height - 60
-
-    c.setFont("Helvetica-Bold", 16)
-    c.drawString(x, y, title)
-    y -= 30
-
-    c.setFont("Helvetica", 11)
-
-    for line in text.splitlines():
-        if y < 60:
-            c.showPage()
-            c.setFont("Helvetica", 11)
-            y = height - 60
-        c.drawString(x, y, line[:120])
-        y -= 16
-
-    c.save()
-    buffer.seek(0)
-    return buffer.read()
-
-# ----------------------------
-# UI
-# ----------------------------
 st.set_page_config(page_title="Offertly", layout="wide")
 
-st.title("Offertly – offertmotor för bygg & VVS")
-st.caption("Välj paket, betala och skapa offerter (PDF).")
+# ====== Secrets / ENV ======
+BACKEND_BASE_URL = (st.secrets.get("BACKEND_BASE_URL") or os.environ.get("BACKEND_BASE_URL") or "").rstrip("/")
+APP_WEBHOOK_TOKEN = st.secrets.get("APP_WEBHOOK_TOKEN") or os.environ.get("APP_WEBHOOK_TOKEN") or ""
 
-with st.sidebar:
-    st.subheader("Inloggning")
-    email = st.text_input("Email", placeholder="din@email.se").strip().lower()
+# Price IDs (visas som “OK” i din sidebar när de finns)
+PRICE_STARTER = st.secrets.get("STRIPE_PRICE_ID_STARTER") or os.environ.get("STRIPE_PRICE_ID_STARTER") or ""
+PRICE_PRO = st.secrets.get("STRIPE_PRICE_ID_PRO") or os.environ.get("STRIPE_PRICE_ID_PRO") or ""
+PRICE_TEAM = st.secrets.get("STRIPE_PRICE_ID_TEAM") or os.environ.get("STRIPE_PRICE_ID_TEAM") or ""
+
+def auth_headers():
+    return {"Authorization": f"Bearer {APP_WEBHOOK_TOKEN}"}
+
+def backend_get(path: str, params=None):
+    url = f"{BACKEND_BASE_URL}{path}"
+    r = requests.get(url, headers=auth_headers(), params=params, timeout=25)
+    r.raise_for_status()
+    return r.json()
+
+def backend_post(path: str, payload: dict):
+    url = f"{BACKEND_BASE_URL}{path}"
+    r = requests.post(url, headers=auth_headers(), json=payload, timeout=25)
+    r.raise_for_status()
+    return r.json()
+
+# ====== UI ======
+left, main = st.columns([0.26, 0.74], gap="large")
+
+with left:
+    st.markdown("### Inloggning")
+    email = st.text_input("Email", value=st.session_state.get("email", ""))
+
     st.divider()
 
-    # Basic diagnostics
-    st.caption("Status (debug)")
-    st.write("Stripe:", "✅" if STRIPE_SECRET_KEY else "❌")
+    st.markdown("#### Status (debug)")
+    stripe_ok = bool(PRICE_STARTER and PRICE_PRO and PRICE_TEAM)
+    st.write("Stripe:", "✅" if stripe_ok else "❌")
     st.write("BACKEND_BASE_URL:", "✅" if BACKEND_BASE_URL else "❌")
-    st.write("APP_BASE_URL:", "✅" if APP_BASE_URL else "❌")
-    st.write("Price IDs:", "✅" if (PRICE_STARTER and PRICE_PRO and PRICE_TEAM) else "❌")
+    st.write("APP_WEBHOOK_TOKEN:", "✅" if APP_WEBHOOK_TOKEN else "❌")
+    st.write("Price IDs:", "✅" if stripe_ok else "❌")
 
-if not email:
-    st.info("Skriv din email för att fortsätta.")
-    st.stop()
+    st.divider()
 
-sub = backend_get_subscription(email)
-if not sub.get("ok"):
-    st.error(sub.get("error", "Okänt fel när appen försökte kontakta backend."))
-    st.stop()
+    if st.button("Logga ut"):
+        st.session_state.clear()
+        st.rerun()
 
-active = bool(sub.get("active"))
-status = sub.get("status", "")
+with main:
+    st.title("Offertly – offertmotor för bygg & VVS")
+    st.caption("Välj paket, betala och skapa offerter (PDF).")
 
-col1, col2 = st.columns([2, 1], gap="large")
+    # Require email
+    if not email:
+        st.info("Skriv din email för att fortsätta.")
+        st.stop()
 
-with col2:
-    st.subheader("Abonnemang")
-    if active:
-        st.success(f"Aktiv ({status})")
-        portal_url = create_customer_portal(sub.get("customer_id", ""))
-        if portal_url:
-            st.link_button("Hantera abonnemang", portal_url)
-    else:
-        st.warning("Inte aktivt")
+    st.session_state["email"] = email.strip().lower()
 
-with col1:
-    if not active:
-        st.subheader("Välj paket & betala")
+    # Basic sanity checks
+    if not BACKEND_BASE_URL:
+        st.error("BACKEND_BASE_URL saknas i Streamlit secrets.")
+        st.stop()
+    if not APP_WEBHOOK_TOKEN:
+        st.error("APP_WEBHOOK_TOKEN saknas i Streamlit secrets.")
+        st.stop()
 
-        plans = {
-            "Starter": PRICE_STARTER,
-            "Pro": PRICE_PRO,
-            "Team": PRICE_TEAM,
-        }
-        plan_name = st.radio("Paket", list(plans.keys()), horizontal=True)
-        chosen_price = plans[plan_name]
+    # Fetch status + prices
+    try:
+        status = backend_get("/api/status", params={"email": st.session_state["email"]})
+        prices = backend_get("/api/prices")
+    except requests.HTTPError as e:
+        st.error(f"Backend error: {e}")
+        st.stop()
+    except Exception as e:
+        st.error(f"Kunde inte nå backend: {e}")
+        st.stop()
 
-        if not chosen_price:
-            st.error("Saknar Price ID i Secrets för valt paket.")
-            st.stop()
+    plan = status.get("plan", "free")
+    acct_status = status.get("status", "inactive")
 
-        if st.button("Gå till Stripe Checkout", type="primary"):
-            if not APP_BASE_URL:
-                st.error("APP_BASE_URL saknas i Streamlit Secrets (behövs för success/cancel).")
-                st.stop()
+    # Packages
+    st.subheader("Paket")
 
-            try:
-                checkout = stripe.checkout.Session.create(
-                    mode="subscription",
-                    customer_email=email,
-                    line_items=[{"price": chosen_price, "quantity": 1}],
-                    success_url=f"{APP_BASE_URL}?success=1&session_id={{CHECKOUT_SESSION_ID}}",
-                    cancel_url=f"{APP_BASE_URL}?canceled=1",
-                    allow_promotion_codes=True,
-                )
-                st.success("Checkout skapad!")
-                st.link_button("Öppna betalning", checkout.url)
-                st.caption("Efter betalning uppdateras din status via webhook (kan ta några sekunder).")
-            except Exception as e:
-                st.error(f"Kunde inte skapa Checkout: {e}")
+    col1, col2, col3 = st.columns(3)
 
-        st.divider()
-        st.subheader("Efter betalning")
-        st.write("Tryck här om du vill uppdatera status manuellt:")
-        if st.button("Uppdatera abonnemangstatus"):
-            st.rerun()
+    def package_card(col, key, title, price_id, perks):
+        with col:
+            st.markdown(f"#### {title}")
+            for p in perks:
+                st.write("•", p)
 
-    else:
-        st.subheader("Offertgenerator")
+            if not price_id:
+                st.warning("Price ID saknas (kolla secrets).")
+                return
 
-        company = st.text_input("Företagsnamn", value="", placeholder="Ex: Bygg & VVS AB")
-        customer = st.text_input("Kundens namn", value="", placeholder="Ex: Anna Andersson")
-        description = st.text_area("Beskrivning", value="", height=160, placeholder="Ex: totalrenovering badrum...")
+            if plan == key and acct_status == "active":
+                st.success("Aktivt abonnemang")
+                return
 
-        if st.button("Generera offert (PDF)", type="primary"):
-            if not company or not customer or not description:
-                st.error("Fyll i företagsnamn, kundens namn och beskrivning.")
-                st.stop()
+            if st.button(f"Välj {title}", key=f"buy_{key}", use_container_width=True):
+                try:
+                    out = backend_post("/api/create-checkout-session", {"email": st.session_state["email"], "price_id": price_id})
+                    st.success("Öppnar Stripe Checkout…")
+                    st.link_button("Fortsätt till betalning", out["url"], use_container_width=True)
+                except requests.HTTPError as e:
+                    st.error(f"Checkout error: {e}")
+                except Exception as e:
+                    st.error(f"Checkout error: {e}")
 
-            text = generate_offer_text(company, customer, description)
-            pdf = pdf_bytes_from_text("Offertly – Offert", text)
+    package_card(
+        col1,
+        "starter",
+        "Starter",
+        prices.get("starter", {}).get("price_id") or PRICE_STARTER,
+        ["AI-offert", "PDF-export", "Grundläggande mallar"],
+    )
+    package_card(
+        col2,
+        "pro",
+        "Pro",
+        prices.get("pro", {}).get("price_id") or PRICE_PRO,
+        ["Allt i Starter", "Fler mallar", "Offert-historik"],
+    )
+    package_card(
+        col3,
+        "team",
+        "Team",
+        prices.get("team", {}).get("price_id") or PRICE_TEAM,
+        ["Allt i Pro", "Teamkonton", "Roller & behörigheter"],
+    )
 
-            st.success("Offert klar!")
-            st.text_area("Förhandsvisning (text)", value=text, height=220)
-            st.download_button(
-                "Ladda ner PDF",
-                data=pdf,
-                file_name=f"offert_{customer.replace(' ', '_')}.pdf",
-                mime="application/pdf",
-            )
+    st.divider()
+
+    st.subheader("Offertgenerator")
+
+    if acct_status != "active":
+        st.info("Du behöver ett aktivt abonnemang för att skapa offerter.")
+        st.stop()
+
+    # Logo (optional) – visar bara om filen finns i Streamlit deploy
+    if os.path.exists("logo.png"):
+        st.image("logo.png", width=120)
+
+    company = st.text_input("Företagsnamn")
+    customer = st.text_input("Kundens namn")
+    desc = st.text_area("Beskrivning", height=140, placeholder="Ex: totalrenovering badrum, 6 kvm…")
+
+    if st.button("Generera offert (AI)", use_container_width=True):
+        # Här kopplar vi in din AI + PDF i nästa steg.
+        # Just nu ger vi en tydlig placeholder så du inte får “ingenting händer”.
+        if not (company and customer and desc):
+            st.warning("Fyll i företagsnamn, kundens namn och beskrivning.")
+        else:
+            st.success("OK – nästa steg är att koppla AI + PDF-generering här.")
+            st.write({"company": company, "customer": customer, "desc": desc, "plan": plan})
 
 
 
@@ -254,6 +177,7 @@ with col1:
 
 
     
+
 
 
 
