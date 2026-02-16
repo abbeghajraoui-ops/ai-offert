@@ -1,229 +1,259 @@
 import os
-import json
 import time
-import urllib.request
-import urllib.error
+import json
+import sqlite3
+from functools import wraps
 
-import streamlit as st
-
-# ----------------------------
-# Config / Secrets
-# ----------------------------
-APP_TITLE = "Offertly – offertmotor för bygg & VVS"
-
-def sget(key: str, default=""):
-    # Streamlit Cloud secrets -> st.secrets
-    try:
-        return st.secrets.get(key, default)
-    except Exception:
-        return os.environ.get(key, default)
-
-STRIPE_PRICE_ID_STARTER = sget("STRIPE_PRICE_ID_STARTER")
-STRIPE_PRICE_ID_PRO = sget("STRIPE_PRICE_ID_PRO")
-STRIPE_PRICE_ID_TEAM = sget("STRIPE_PRICE_ID_TEAM")
-
-BACKEND_BASE_URL = (sget("BACKEND_BASE_URL") or "").rstrip("/")
-APP_WEBHOOK_TOKEN = sget("APP_WEBHOOK_TOKEN")
-
-OPENAI_API_KEY = sget("OPENAI_API_KEY", "")  # valfritt
+import stripe
+from flask import Flask, request, jsonify, abort
 
 # ----------------------------
-# Helpers (HTTP)
+# Config
 # ----------------------------
-def backend_get(path: str, params: dict | None = None):
-    if not BACKEND_BASE_URL:
-        raise RuntimeError("BACKEND_BASE_URL saknas i secrets")
+app = Flask(__name__)
 
-    url = BACKEND_BASE_URL + path
-    if params:
-        qs = urllib.parse.urlencode(params)
-        url = url + ("&" if "?" in url else "?") + qs
+STRIPE_SECRET_KEY = os.environ.get("STRIPE_SECRET_KEY", "")
+STRIPE_WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET", "")
+APP_WEBHOOK_TOKEN = os.environ.get("APP_WEBHOOK_TOKEN", "")
+DB_PATH = os.environ.get("DB_PATH", "offertly.db")
 
-    req = urllib.request.Request(url, method="GET")
-    req.add_header("Authorization", f"Bearer {APP_WEBHOOK_TOKEN}")
-    with urllib.request.urlopen(req, timeout=20) as resp:
-        return json.loads(resp.read().decode("utf-8"))
+if not STRIPE_SECRET_KEY:
+    print("WARN: STRIPE_SECRET_KEY missing")
+stripe.api_key = STRIPE_SECRET_KEY
 
-def backend_post(path: str, payload: dict):
-    if not BACKEND_BASE_URL:
-        raise RuntimeError("BACKEND_BASE_URL saknas i secrets")
-
-    url = BACKEND_BASE_URL + path
-    body = json.dumps(payload).encode("utf-8")
-
-    req = urllib.request.Request(url, data=body, method="POST")
-    req.add_header("Content-Type", "application/json")
-    req.add_header("Authorization", f"Bearer {APP_WEBHOOK_TOKEN}")
-
-    with urllib.request.urlopen(req, timeout=20) as resp:
-        return json.loads(resp.read().decode("utf-8"))
-
-def ok_or_err(fn, *args, **kwargs):
-    try:
-        return True, fn(*args, **kwargs)
-    except urllib.error.HTTPError as e:
-        try:
-            msg = e.read().decode("utf-8")
-        except Exception:
-            msg = str(e)
-        return False, f"HTTP Error {e.code}: {msg}"
-    except Exception as e:
-        return False, str(e)
 
 # ----------------------------
-# UI
+# DB
 # ----------------------------
-st.set_page_config(page_title="Offertly", layout="wide")
-st.title(APP_TITLE)
-st.caption("Välj paket, betala och skapa offerter (PDF).")
+def db():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
 
-# Sidebar (login + debug)
-with st.sidebar:
-    st.header("Inloggning")
-    email = st.text_input("Email", placeholder="din@email.se").strip().lower()
 
-    st.divider()
-    st.subheader("Status (debug)")
+def init_db():
+    with db() as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS subscriptions (
+                email TEXT PRIMARY KEY,
+                customer_id TEXT,
+                subscription_id TEXT,
+                status TEXT,
+                current_period_end INTEGER,
+                updated_at INTEGER
+            )
+            """
+        )
+        conn.commit()
 
-    stripe_ok = all([STRIPE_PRICE_ID_STARTER, STRIPE_PRICE_ID_PRO, STRIPE_PRICE_ID_TEAM])
-    st.write("Stripe:", "✅" if stripe_ok else "❌")
 
-    st.write("BACKEND_BASE_URL:", "✅" if BACKEND_BASE_URL else "❌")
-    st.write("APP_WEBHOOK_TOKEN:", "✅" if APP_WEBHOOK_TOKEN else "❌")
-    st.write("Price IDs:", "✅" if stripe_ok else "❌")
+init_db()
 
-    st.divider()
-    if st.button("Logga ut"):
-        st.session_state.clear()
-        st.rerun()
 
-# Logo (om fil finns)
-try:
-    if os.path.exists("logo.png"):
-        st.sidebar.image("logo.png", width=160)
-except Exception:
-    pass
+def upsert_subscription(email: str, customer_id: str | None, subscription_id: str | None,
+                        status: str | None, current_period_end: int | None):
+    now = int(time.time())
+    with db() as conn:
+        conn.execute(
+            """
+            INSERT INTO subscriptions(email, customer_id, subscription_id, status, current_period_end, updated_at)
+            VALUES(?, ?, ?, ?, ?, ?)
+            ON CONFLICT(email) DO UPDATE SET
+                customer_id=excluded.customer_id,
+                subscription_id=excluded.subscription_id,
+                status=excluded.status,
+                current_period_end=excluded.current_period_end,
+                updated_at=excluded.updated_at
+            """,
+            (email, customer_id, subscription_id, status, current_period_end, now),
+        )
+        conn.commit()
 
-# Require email to proceed
-if not email:
-    st.info("Skriv din email för att fortsätta.")
-    st.stop()
 
-# Check subscription status from backend
-if not APP_WEBHOOK_TOKEN:
-    st.error("APP_WEBHOOK_TOKEN saknas i Streamlit secrets.")
-    st.stop()
+def get_subscription(email: str):
+    with db() as conn:
+        row = conn.execute(
+            "SELECT * FROM subscriptions WHERE email = ?",
+            (email.strip().lower(),),
+        ).fetchone()
+    return dict(row) if row else None
 
-ok, sub_resp = ok_or_err(backend_get, "/api/subscription", {"email": email})
-if not ok:
-    st.error(f"Backend error: {sub_resp}")
-    st.stop()
 
-active = bool(sub_resp.get("active"))
+def is_active(sub: dict | None) -> bool:
+    if not sub:
+        return False
+    status = (sub.get("status") or "").lower()
+    cpe = sub.get("current_period_end") or 0
+    now = int(time.time())
+    # Stripe "active" är aktiv. "trialing" kan också räknas som aktiv om du vill.
+    return status in ("active", "trialing") and cpe > now
+
 
 # ----------------------------
-# Plans / Checkout
+# Auth between Streamlit <-> Backend
 # ----------------------------
-def go_checkout(price_id: str, plan_name: str):
-    # success/cancel tillbaka till samma sida
-    current_url = st.get_option("browser.serverAddress")  # kan vara None på cloud
-    # robust: använd st.experimental_get_query_params + known base
-    # enklast: hardcode din app-url i secrets om du vill, men vi kör "relative safe":
-    app_url = sget("APP_BASE_URL", "").rstrip("/")
-    if not app_url:
-        # fallback: använd nuvarande sida (brukar funka på Streamlit Cloud via browser)
-        app_url = st.request.url if hasattr(st, "request") else ""
+def require_token(fn):
+    @wraps(fn)
+    def wrapper(*args, **kwargs):
+        if not APP_WEBHOOK_TOKEN:
+            return jsonify({"error": "Server not configured (APP_WEBHOOK_TOKEN missing)"}), 500
 
-    success_url = f"{app_url}?success=1"
-    cancel_url = f"{app_url}?cancel=1"
+        auth = request.headers.get("Authorization", "")
+        # Expect: Authorization: Bearer <token>
+        if not auth.startswith("Bearer "):
+            return jsonify({"error": "Unauthorized (missing bearer token)"}), 401
 
-    payload = {
+        token = auth.replace("Bearer ", "", 1).strip()
+        if token != APP_WEBHOOK_TOKEN:
+            return jsonify({"error": "Unauthorized (bad token)"}), 401
+
+        return fn(*args, **kwargs)
+    return wrapper
+
+
+# ----------------------------
+# Basic endpoints
+# ----------------------------
+@app.get("/health")
+def health():
+    return jsonify({"ok": True})
+
+
+@app.get("/api/subscription")
+@require_token
+def api_subscription():
+    email = (request.args.get("email") or "").strip().lower()
+    if not email:
+        return jsonify({"error": "email required"}), 400
+
+    sub = get_subscription(email)
+    return jsonify({
         "email": email,
-        "price_id": price_id,
-        "success_url": success_url,
-        "cancel_url": cancel_url,
-    }
-    ok2, resp2 = ok_or_err(backend_post, "/api/create-checkout-session", payload)
-    if not ok2:
-        st.error(f"Kunde inte skapa checkout: {resp2}")
-        return
+        "found": bool(sub),
+        "active": is_active(sub),
+        "subscription": sub,
+    })
 
-    url = resp2.get("url")
-    if not url:
-        st.error("Ingen checkout-URL returnerades.")
-        return
 
-    st.success(f"Skickar dig till Stripe Checkout för {plan_name}…")
-    st.link_button("Öppna Stripe Checkout", url)
+@app.post("/api/create-checkout-session")
+@require_token
+def create_checkout_session():
+    """
+    Body JSON:
+      {
+        "email": "kund@firma.se",
+        "price_id": "price_...",
+        "success_url": "https://din-streamlit-app?success=1",
+        "cancel_url": "https://din-streamlit-app?cancel=1"
+      }
+    """
+    data = request.get_json(force=True, silent=True) or {}
+    email = (data.get("email") or "").strip().lower()
+    price_id = (data.get("price_id") or "").strip()
+    success_url = (data.get("success_url") or "").strip()
+    cancel_url = (data.get("cancel_url") or "").strip()
 
-# If not active -> show pricing
-if not active:
-    st.warning("Din plan är inte aktiv ännu. Välj ett paket för att fortsätta.")
-    cols = st.columns(3)
+    if not (email and price_id and success_url and cancel_url):
+        return jsonify({"error": "email, price_id, success_url, cancel_url required"}), 400
 
-    with cols[0]:
-        st.subheader("Starter")
-        st.write("För små firmor")
-        st.write("✅ Offertgenerator")
-        st.write("✅ PDF")
-        if st.button("Välj Starter", use_container_width=True):
-            go_checkout(STRIPE_PRICE_ID_STARTER, "Starter")
+    try:
+        session = stripe.checkout.Session.create(
+            mode="subscription",
+            customer_email=email,
+            line_items=[{"price": price_id, "quantity": 1}],
+            success_url=success_url,
+            cancel_url=cancel_url,
+            allow_promotion_codes=True,
+        )
+        return jsonify({"url": session.url})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
-    with cols[1]:
-        st.subheader("Pro")
-        st.write("För växande firmor")
-        st.write("✅ Allt i Starter")
-        st.write("✅ Mer kapacitet")
-        if st.button("Välj Pro", use_container_width=True):
-            go_checkout(STRIPE_PRICE_ID_PRO, "Pro")
-
-    with cols[2]:
-        st.subheader("Team")
-        st.write("För team")
-        st.write("✅ Allt i Pro")
-        st.write("✅ Flera användare")
-        if st.button("Välj Team", use_container_width=True):
-            go_checkout(STRIPE_PRICE_ID_TEAM, "Team")
-
-    st.info("När betalningen är klar kan det ta några sekunder innan webbhooken uppdaterar din plan. Uppdatera sidan.")
-    st.stop()
 
 # ----------------------------
-# Offertgenerator (låst bakom aktiv plan)
+# Stripe Webhook
 # ----------------------------
-st.success("Plan aktiv ✅ Du kan skapa offerter.")
+@app.post("/stripe/webhook")
+def stripe_webhook():
+    payload = request.data
+    sig_header = request.headers.get("Stripe-Signature", "")
 
-st.header("Offertgenerator")
-
-colA, colB = st.columns([2, 1], gap="large")
-with colA:
-    company = st.text_input("Företagsnamn", value="")
-    customer = st.text_input("Kundens namn", value="")
-    desc = st.text_area("Beskrivning", height=140, placeholder="t.ex. totalrenovering badrum, 6 kvm...")
-
-    if st.button("Generera offert (AI)", type="primary", use_container_width=True):
-        if not (company and customer and desc):
-            st.error("Fyll i företagsnamn, kundnamn och beskrivning.")
+    # 1) Verify signature (om du har STRIPE_WEBHOOK_SECRET)
+    try:
+        if STRIPE_WEBHOOK_SECRET:
+            event = stripe.Webhook.construct_event(payload, sig_header, STRIPE_WEBHOOK_SECRET)
         else:
-            # Här kan du koppla på din befintliga AI/PDF-logik.
-            # Jag gör en stabil fallback-text så det aldrig kraschar.
-            offer_text = f"""OFFERT
+            # Fallback (inte rekommenderat): acceptera utan signatur i dev
+            event = json.loads(payload.decode("utf-8"))
+    except Exception as e:
+        print("Webhook signature verify failed:", e)
+        return "Bad Request", 400
 
-Företag: {company}
-Kund: {customer}
+    event_type = event.get("type", "")
+    obj = (event.get("data") or {}).get("object") or {}
 
-Beskrivning:
-{desc}
+    try:
+        # checkout.session.completed (bra för att få email + customer + subscription)
+        if event_type == "checkout.session.completed":
+            email = (obj.get("customer_details") or {}).get("email") or obj.get("customer_email")
+            customer_id = obj.get("customer")
+            subscription_id = obj.get("subscription")
 
-Pris: (AI/beräkning kan kopplas in här)
-Villkor: 30 dagar betalning
-"""
-            st.text_area("Genererad offert (utkast)", offer_text, height=260)
+            cpe = None
+            status = None
+            if subscription_id:
+                sub = stripe.Subscription.retrieve(subscription_id)
+                status = sub.get("status")
+                cpe = sub.get("current_period_end")
 
-with colB:
-    st.subheader("Tips")
-    st.write("• Om du vill ha din tidigare PDF-funktion, säg till så bygger vi in den här igen.")
-    st.write("• Om din AI del ska använda OpenAI: lägg `OPENAI_API_KEY` i Streamlit secrets.")
+            if email:
+                upsert_subscription(email.strip().lower(), customer_id, subscription_id, status, cpe)
+
+        # customer.subscription.created / updated / deleted
+        elif event_type.startswith("customer.subscription."):
+            subscription_id = obj.get("id")
+            customer_id = obj.get("customer")
+            status = obj.get("status")
+            cpe = obj.get("current_period_end")
+
+            # Hämta email via customer (robust)
+            email = None
+            if customer_id:
+                cust = stripe.Customer.retrieve(customer_id)
+                email = cust.get("email")
+
+            if email:
+                upsert_subscription(email.strip().lower(), customer_id, subscription_id, status, cpe)
+
+        # invoice.paid (ofta bra som extra “bekräftelse”)
+        elif event_type == "invoice.paid":
+            customer_id = obj.get("customer")
+            subscription_id = obj.get("subscription")
+
+            email = None
+            if customer_id:
+                cust = stripe.Customer.retrieve(customer_id)
+                email = cust.get("email")
+
+            cpe = None
+            status = None
+            if subscription_id:
+                sub = stripe.Subscription.retrieve(subscription_id)
+                status = sub.get("status")
+                cpe = sub.get("current_period_end")
+
+            if email:
+                upsert_subscription(email.strip().lower(), customer_id, subscription_id, status, cpe)
+
+        # Ignorera allt annat
+        return "", 200
+
+    except Exception as e:
+        print("Webhook handler error:", e)
+        # Stripe vill ofta ha 2xx. Men om du vill retry:a vid fel, returnera 500.
+        return "Internal Server Error", 500
+
 
 
 
