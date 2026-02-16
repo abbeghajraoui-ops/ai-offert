@@ -1,28 +1,29 @@
 import os
+import time
 import json
 import sqlite3
-from datetime import datetime, timezone
+from functools import wraps
 
 import stripe
 from flask import Flask, request, jsonify, abort
 
-app = Flask(__name__)
-
 # ----------------------------
 # Config
 # ----------------------------
-STRIPE_SECRET_KEY = os.environ.get("STRIPE_SECRET_KEY", "").strip()
-STRIPE_WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET", "").strip()
-APP_WEBHOOK_TOKEN = os.environ.get("APP_WEBHOOK_TOKEN", "").strip()  # shared secret between Streamlit and this backend
+app = Flask(__name__)
+
+STRIPE_SECRET_KEY = os.environ.get("STRIPE_SECRET_KEY", "")
+STRIPE_WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET", "")
+APP_WEBHOOK_TOKEN = os.environ.get("APP_WEBHOOK_TOKEN", "")
 DB_PATH = os.environ.get("DB_PATH", "offertly.db")
 
 if not STRIPE_SECRET_KEY:
-    print("WARNING: STRIPE_SECRET_KEY missing")
+    print("WARN: STRIPE_SECRET_KEY missing")
 stripe.api_key = STRIPE_SECRET_KEY
 
 
 # ----------------------------
-# DB helpers
+# DB
 # ----------------------------
 def db():
     conn = sqlite3.connect(DB_PATH)
@@ -31,211 +32,143 @@ def db():
 
 
 def init_db():
-    conn = db()
-    cur = conn.cursor()
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS users (
-            email TEXT PRIMARY KEY,
-            customer_id TEXT,
-            subscription_id TEXT,
-            price_id TEXT,
-            plan TEXT,
-            status TEXT,
-            current_period_start INTEGER,
-            current_period_end INTEGER,
-            created_at INTEGER,
-            updated_at INTEGER
+    with db() as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS subscriptions (
+                email TEXT PRIMARY KEY,
+                customer_id TEXT,
+                subscription_id TEXT,
+                status TEXT,
+                current_period_end INTEGER,
+                updated_at INTEGER
+            )
+            """
         )
-        """
-    )
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS checkout_sessions (
-            id TEXT PRIMARY KEY,
-            email TEXT,
-            customer_id TEXT,
-            subscription_id TEXT,
-            price_id TEXT,
-            created_at INTEGER
-        )
-        """
-    )
-    conn.commit()
-    conn.close()
+        conn.commit()
 
 
 init_db()
 
 
-def now_ts() -> int:
-    return int(datetime.now(timezone.utc).timestamp())
-
-
-def plan_from_price(price_id: str) -> str:
-    # You can name these whatever you want
-    mapping = {
-        os.environ.get("STRIPE_PRICE_ID_STARTER", ""): "starter",
-        os.environ.get("STRIPE_PRICE_ID_PRO", ""): "pro",
-        os.environ.get("STRIPE_PRICE_ID_TEAM", ""): "team",
-    }
-    return mapping.get(price_id, "unknown")
-
-
-def upsert_user(
-    email: str,
-    customer_id: str | None = None,
-    subscription_id: str | None = None,
-    price_id: str | None = None,
-    status: str | None = None,
-    current_period_start: int | None = None,
-    current_period_end: int | None = None,
-):
-    conn = db()
-    cur = conn.cursor()
-    existing = cur.execute("SELECT email FROM users WHERE email = ?", (email,)).fetchone()
-    ts = now_ts()
-
-    plan = plan_from_price(price_id) if price_id else None
-
-    if existing:
-        cur.execute(
+def upsert_subscription(email: str, customer_id: str | None, subscription_id: str | None,
+                        status: str | None, current_period_end: int | None):
+    now = int(time.time())
+    with db() as conn:
+        conn.execute(
             """
-            UPDATE users SET
-              customer_id = COALESCE(?, customer_id),
-              subscription_id = COALESCE(?, subscription_id),
-              price_id = COALESCE(?, price_id),
-              plan = COALESCE(?, plan),
-              status = COALESCE(?, status),
-              current_period_start = COALESCE(?, current_period_start),
-              current_period_end = COALESCE(?, current_period_end),
-              updated_at = ?
-            WHERE email = ?
+            INSERT INTO subscriptions(email, customer_id, subscription_id, status, current_period_end, updated_at)
+            VALUES(?, ?, ?, ?, ?, ?)
+            ON CONFLICT(email) DO UPDATE SET
+                customer_id=excluded.customer_id,
+                subscription_id=excluded.subscription_id,
+                status=excluded.status,
+                current_period_end=excluded.current_period_end,
+                updated_at=excluded.updated_at
             """,
-            (
-                customer_id,
-                subscription_id,
-                price_id,
-                plan,
-                status,
-                current_period_start,
-                current_period_end,
-                ts,
-                email,
-            ),
+            (email, customer_id, subscription_id, status, current_period_end, now),
         )
-    else:
-        cur.execute(
-            """
-            INSERT INTO users (
-              email, customer_id, subscription_id, price_id, plan, status,
-              current_period_start, current_period_end, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                email,
-                customer_id,
-                subscription_id,
-                price_id,
-                plan,
-                status or "incomplete",
-                current_period_start,
-                current_period_end,
-                ts,
-                ts,
-            ),
-        )
-
-    conn.commit()
-    conn.close()
+        conn.commit()
 
 
-def require_token():
-    # Streamlit -> Backend auth
-    # Header: Authorization: Bearer <APP_WEBHOOK_TOKEN>
-    auth = request.headers.get("Authorization", "")
-    if not APP_WEBHOOK_TOKEN:
-        abort(500, "APP_WEBHOOK_TOKEN not configured on backend")
-    if not auth.startswith("Bearer "):
-        abort(401)
-    token = auth.replace("Bearer ", "", 1).strip()
-    if token != APP_WEBHOOK_TOKEN:
-        abort(401)
+def get_subscription(email: str):
+    with db() as conn:
+        row = conn.execute(
+            "SELECT * FROM subscriptions WHERE email = ?",
+            (email.strip().lower(),),
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def is_active(sub: dict | None) -> bool:
+    if not sub:
+        return False
+    status = (sub.get("status") or "").lower()
+    cpe = sub.get("current_period_end") or 0
+    now = int(time.time())
+    # Stripe "active" är aktiv. "trialing" kan också räknas som aktiv om du vill.
+    return status in ("active", "trialing") and cpe > now
 
 
 # ----------------------------
-# Health
+# Auth between Streamlit <-> Backend
+# ----------------------------
+def require_token(fn):
+    @wraps(fn)
+    def wrapper(*args, **kwargs):
+        if not APP_WEBHOOK_TOKEN:
+            return jsonify({"error": "Server not configured (APP_WEBHOOK_TOKEN missing)"}), 500
+
+        auth = request.headers.get("Authorization", "")
+        # Expect: Authorization: Bearer <token>
+        if not auth.startswith("Bearer "):
+            return jsonify({"error": "Unauthorized (missing bearer token)"}), 401
+
+        token = auth.replace("Bearer ", "", 1).strip()
+        if token != APP_WEBHOOK_TOKEN:
+            return jsonify({"error": "Unauthorized (bad token)"}), 401
+
+        return fn(*args, **kwargs)
+    return wrapper
+
+
+# ----------------------------
+# Basic endpoints
 # ----------------------------
 @app.get("/health")
 def health():
     return jsonify({"ok": True})
 
 
-# ----------------------------
-# API: Streamlit uses these
-# ----------------------------
+@app.get("/api/subscription")
+@require_token
+def api_subscription():
+    email = (request.args.get("email") or "").strip().lower()
+    if not email:
+        return jsonify({"error": "email required"}), 400
+
+    sub = get_subscription(email)
+    return jsonify({
+        "email": email,
+        "found": bool(sub),
+        "active": is_active(sub),
+        "subscription": sub,
+    })
+
+
 @app.post("/api/create-checkout-session")
+@require_token
 def create_checkout_session():
-    require_token()
-    data = request.get_json(force=True) or {}
+    """
+    Body JSON:
+      {
+        "email": "kund@firma.se",
+        "price_id": "price_...",
+        "success_url": "https://din-streamlit-app?success=1",
+        "cancel_url": "https://din-streamlit-app?cancel=1"
+      }
+    """
+    data = request.get_json(force=True, silent=True) or {}
     email = (data.get("email") or "").strip().lower()
     price_id = (data.get("price_id") or "").strip()
     success_url = (data.get("success_url") or "").strip()
     cancel_url = (data.get("cancel_url") or "").strip()
 
-    if not email or not price_id or not success_url or not cancel_url:
-        return jsonify({"error": "Missing email/price_id/success_url/cancel_url"}), 400
+    if not (email and price_id and success_url and cancel_url):
+        return jsonify({"error": "email, price_id, success_url, cancel_url required"}), 400
 
-    # Create Stripe Checkout Session for SUBSCRIPTION
-    session = stripe.checkout.Session.create(
-        mode="subscription",
-        customer_email=email,
-        line_items=[{"price": price_id, "quantity": 1}],
-        success_url=f"{success_url}?success=1&session_id={{CHECKOUT_SESSION_ID}}",
-        cancel_url=f"{cancel_url}?canceled=1",
-        allow_promotion_codes=True,
-    )
-
-    # Save session (optional but useful)
-    conn = db()
-    conn.execute(
-        """
-        INSERT OR REPLACE INTO checkout_sessions (id, email, customer_id, subscription_id, price_id, created_at)
-        VALUES (?, ?, NULL, NULL, ?, ?)
-        """,
-        (session["id"], email, price_id, now_ts()),
-    )
-    conn.commit()
-    conn.close()
-
-    return jsonify({"checkout_url": session["url"], "id": session["id"]})
-
-
-@app.get("/api/status")
-def api_status():
-    require_token()
-    email = (request.args.get("email") or "").strip().lower()
-    if not email:
-        return jsonify({"error": "Missing email"}), 400
-
-    conn = db()
-    row = conn.execute("SELECT * FROM users WHERE email = ?", (email,)).fetchone()
-    conn.close()
-
-    if not row:
-        return jsonify({"email": email, "status": "none", "plan": None})
-
-    return jsonify(
-        {
-            "email": row["email"],
-            "status": row["status"],
-            "plan": row["plan"],
-            "price_id": row["price_id"],
-            "subscription_id": row["subscription_id"],
-            "current_period_start": row["current_period_start"],
-            "current_period_end": row["current_period_end"],
-        }
-    )
+    try:
+        session = stripe.checkout.Session.create(
+            mode="subscription",
+            customer_email=email,
+            line_items=[{"price": price_id, "quantity": 1}],
+            success_url=success_url,
+            cancel_url=cancel_url,
+            allow_promotion_codes=True,
+        )
+        return jsonify({"url": session.url})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 
 # ----------------------------
@@ -244,108 +177,83 @@ def api_status():
 @app.post("/stripe/webhook")
 def stripe_webhook():
     payload = request.data
-    sig_header = request.headers.get("Stripe-Signature")
+    sig_header = request.headers.get("Stripe-Signature", "")
 
+    # 1) Verify signature (om du har STRIPE_WEBHOOK_SECRET)
     try:
-        event = stripe.Webhook.construct_event(payload, sig_header, STRIPE_WEBHOOK_SECRET)
+        if STRIPE_WEBHOOK_SECRET:
+            event = stripe.Webhook.construct_event(payload, sig_header, STRIPE_WEBHOOK_SECRET)
+        else:
+            # Fallback (inte rekommenderat): acceptera utan signatur i dev
+            event = json.loads(payload.decode("utf-8"))
     except Exception as e:
-        print("Webhook signature verification failed:", str(e))
-        return "bad", 400
+        print("Webhook signature verify failed:", e)
+        return "Bad Request", 400
 
-    event_type = event["type"]
-    obj = event["data"]["object"]
+    event_type = event.get("type", "")
+    obj = (event.get("data") or {}).get("object") or {}
 
     try:
+        # checkout.session.completed (bra för att få email + customer + subscription)
         if event_type == "checkout.session.completed":
-            # obj is a Checkout Session
-            email = (obj.get("customer_email") or "").strip().lower()
+            email = (obj.get("customer_details") or {}).get("email") or obj.get("customer_email")
             customer_id = obj.get("customer")
             subscription_id = obj.get("subscription")
 
-            price_id = None
-            period_start = None
-            period_end = None
-            status = "active"
-
-            # Retrieve subscription to get price_id + period dates
+            cpe = None
+            status = None
             if subscription_id:
-                sub = stripe.Subscription.retrieve(subscription_id, expand=["items.data.price"])
-                status = sub.get("status") or status
-                period_start = sub.get("current_period_start")
-                period_end = sub.get("current_period_end")
-                items = (sub.get("items") or {}).get("data") or []
-                if items and items[0].get("price"):
-                    price_id = items[0]["price"]["id"]
+                sub = stripe.Subscription.retrieve(subscription_id)
+                status = sub.get("status")
+                cpe = sub.get("current_period_end")
 
             if email:
-                upsert_user(
-                    email=email,
-                    customer_id=customer_id,
-                    subscription_id=subscription_id,
-                    price_id=price_id,
-                    status=status,
-                    current_period_start=period_start,
-                    current_period_end=period_end,
-                )
+                upsert_subscription(email.strip().lower(), customer_id, subscription_id, status, cpe)
 
-        elif event_type in ("customer.subscription.created", "customer.subscription.updated"):
-            # obj is a Subscription
-            sub = obj
-            customer_id = sub.get("customer")
-            status = sub.get("status") or "unknown"
-            period_start = sub.get("current_period_start")
-            period_end = sub.get("current_period_end")
-
-            # Find email via customer
-            email = None
-            if customer_id:
-                cust = stripe.Customer.retrieve(customer_id)
-                email = (cust.get("email") or "").strip().lower()
-
-            price_id = None
-            items = (sub.get("items") or {}).get("data") or []
-            if items and items[0].get("price"):
-                price_id = items[0]["price"]["id"]
-
-            if email:
-                upsert_user(
-                    email=email,
-                    customer_id=customer_id,
-                    subscription_id=sub.get("id"),
-                    price_id=price_id,
-                    status=status,
-                    current_period_start=period_start,
-                    current_period_end=period_end,
-                )
-
-        elif event_type in ("customer.subscription.deleted",):
+        # customer.subscription.created / updated / deleted
+        elif event_type.startswith("customer.subscription."):
+            subscription_id = obj.get("id")
             customer_id = obj.get("customer")
+            status = obj.get("status")
+            cpe = obj.get("current_period_end")
+
+            # Hämta email via customer (robust)
             email = None
             if customer_id:
                 cust = stripe.Customer.retrieve(customer_id)
-                email = (cust.get("email") or "").strip().lower()
-            if email:
-                upsert_user(email=email, status="canceled")
+                email = cust.get("email")
 
+            if email:
+                upsert_subscription(email.strip().lower(), customer_id, subscription_id, status, cpe)
+
+        # invoice.paid (ofta bra som extra “bekräftelse”)
         elif event_type == "invoice.paid":
-            # optional: keep status active
             customer_id = obj.get("customer")
+            subscription_id = obj.get("subscription")
+
             email = None
             if customer_id:
                 cust = stripe.Customer.retrieve(customer_id)
-                email = (cust.get("email") or "").strip().lower()
-            if email:
-                upsert_user(email=email, status="active")
+                email = cust.get("email")
 
-        else:
-            # ignore others
-            pass
+            cpe = None
+            status = None
+            if subscription_id:
+                sub = stripe.Subscription.retrieve(subscription_id)
+                status = sub.get("status")
+                cpe = sub.get("current_period_end")
+
+            if email:
+                upsert_subscription(email.strip().lower(), customer_id, subscription_id, status, cpe)
+
+        # Ignorera allt annat
+        return "", 200
 
     except Exception as e:
-        print("Webhook handler error:", str(e))
-        return "error", 500
+        print("Webhook handler error:", e)
+        # Stripe vill ofta ha 2xx. Men om du vill retry:a vid fel, returnera 500.
+        return "Internal Server Error", 500
 
-    return "ok", 200
 
 
 
