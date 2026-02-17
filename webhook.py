@@ -26,6 +26,8 @@ STRIPE_PRICE_ID_TEAM = os.environ.get("STRIPE_PRICE_ID_TEAM", "").strip()
 
 DB_PATH = os.environ.get("DB_PATH", "offertly.db")
 
+if not STRIPE_SECRET_KEY:
+    print("WARN: STRIPE_SECRET_KEY missing")
 stripe.api_key = STRIPE_SECRET_KEY
 
 
@@ -61,6 +63,10 @@ def init_db():
 init_db()
 
 
+def now_ts() -> int:
+    return int(time.time())
+
+
 def plan_from_price(price_id: str | None) -> str | None:
     if not price_id:
         return None
@@ -73,31 +79,34 @@ def plan_from_price(price_id: str | None) -> str | None:
     return None
 
 
-def get_user(email: str):
-    email = email.strip().lower()
-    with db() as conn:
-        row = conn.execute(
-            "SELECT * FROM users WHERE email = ?",
-            (email,),
-        ).fetchone()
-    return dict(row) if row else None
-
-
 def ensure_user(email: str):
-    email = email.strip().lower()
+    email = (email or "").strip().lower()
+    if not email:
+        return
     with db() as conn:
         conn.execute(
             """
             INSERT OR IGNORE INTO users(email, free_quotes_used, updated_at)
             VALUES(?, 0, ?)
             """,
-            (email, int(time.time())),
+            (email, now_ts()),
         )
         conn.commit()
 
 
+def get_user(email: str):
+    email = (email or "").strip().lower()
+    if not email:
+        return None
+    with db() as conn:
+        row = conn.execute("SELECT * FROM users WHERE email = ?", (email,)).fetchone()
+    return dict(row) if row else None
+
+
 def increment_free_quote(email: str):
-    email = email.strip().lower()
+    email = (email or "").strip().lower()
+    if not email:
+        return
     ensure_user(email)
     with db() as conn:
         conn.execute(
@@ -107,21 +116,9 @@ def increment_free_quote(email: str):
                 updated_at = ?
             WHERE email = ?
             """,
-            (int(time.time()), email),
+            (now_ts(), email),
         )
         conn.commit()
-
-
-def is_active(user: dict | None) -> bool:
-    if not user:
-        return False
-    status = (user.get("status") or "").lower()
-    cpe = int(user.get("current_period_end") or 0)
-    now = int(time.time())
-
-    if status in ("active", "trialing"):
-        return True if cpe == 0 else (cpe > now)
-    return False
 
 
 def upsert_subscription(
@@ -133,8 +130,9 @@ def upsert_subscription(
     plan: str | None,
     price_id: str | None,
 ):
-    now = int(time.time())
-    email = email.strip().lower()
+    email = (email or "").strip().lower()
+    if not email:
+        return
     ensure_user(email)
 
     with db() as conn:
@@ -154,14 +152,30 @@ def upsert_subscription(
                 customer_id,
                 subscription_id,
                 status,
-                current_period_end,
+                int(current_period_end or 0),
                 plan,
                 price_id,
-                now,
+                now_ts(),
                 email,
             ),
         )
         conn.commit()
+
+
+def is_active(user: dict | None) -> bool:
+    if not user:
+        return False
+
+    status = (user.get("status") or "").lower().strip()
+    cpe = int(user.get("current_period_end") or 0)
+    now = now_ts()
+
+    # Active/trialing räknas som aktiv.
+    # Om cpe=0 (saknas) => räknas som aktiv, annars måste den ligga i framtiden.
+    if status in ("active", "trialing"):
+        return True if cpe == 0 else (cpe > now)
+
+    return False
 
 
 # ----------------------------
@@ -202,10 +216,10 @@ def api_status():
         return jsonify({"error": "email required"}), 400
 
     ensure_user(email)
-    user = get_user(email)
+    user = get_user(email) or {}
 
     active = is_active(user)
-    free_used = user.get("free_quotes_used", 0)
+    free_used = int(user.get("free_quotes_used") or 0)
 
     return jsonify(
         {
@@ -214,6 +228,27 @@ def api_status():
             "plan": user.get("plan"),
             "free_used": free_used,
             "free_remaining": max(0, 3 - free_used),
+        }
+    )
+
+
+# Bakåtkompatibilitet om du råkar ha kvar gammal app någonstans:
+@app.get("/api/subscription")
+@require_token
+def api_subscription():
+    email = (request.args.get("email") or "").strip().lower()
+    if not email:
+        return jsonify({"error": "email required"}), 400
+
+    ensure_user(email)
+    user = get_user(email)
+
+    return jsonify(
+        {
+            "email": email,
+            "found": bool(user),
+            "active": is_active(user),
+            "subscription": user,
         }
     )
 
@@ -228,17 +263,19 @@ def api_use_free_quote():
         return jsonify({"error": "email required"}), 400
 
     ensure_user(email)
-    user = get_user(email)
+    user = get_user(email) or {}
 
+    # Har kunden aktiv plan -> ingen begränsning
     if is_active(user):
         return jsonify({"ok": True, "active": True})
 
-    free_used = user.get("free_quotes_used", 0)
+    free_used = int(user.get("free_quotes_used") or 0)
     if free_used >= 3:
+        # 402 = Payment Required (praktiskt för frontend)
         return jsonify({"error": "free_limit_reached"}), 402
 
     increment_free_quote(email)
-    return jsonify({"ok": True, "free_used": free_used + 1})
+    return jsonify({"ok": True, "free_used": free_used + 1, "free_remaining": max(0, 3 - (free_used + 1))})
 
 
 @app.post("/api/create-checkout-session")
@@ -254,16 +291,26 @@ def create_checkout_session():
     if not (email and price_id and success_url and cancel_url):
         return jsonify({"error": "missing fields"}), 400
 
-    session = stripe.checkout.Session.create(
-        mode="subscription",
-        customer_email=email,
-        line_items=[{"price": price_id, "quantity": 1}],
-        success_url=success_url,
-        cancel_url=cancel_url,
-        client_reference_id=email,
-        metadata={"email": email, "price_id": price_id},
-    )
-    return jsonify({"url": session.url})
+    if not STRIPE_SECRET_KEY:
+        return jsonify({"error": "STRIPE_SECRET_KEY missing"}), 500
+
+    # säkerställ user
+    ensure_user(email)
+
+    try:
+        session = stripe.checkout.Session.create(
+            mode="subscription",
+            customer_email=email,
+            line_items=[{"price": price_id, "quantity": 1}],
+            success_url=success_url,
+            cancel_url=cancel_url,
+            client_reference_id=email,
+            allow_promotion_codes=True,
+            metadata={"email": email, "price_id": price_id},
+        )
+        return jsonify({"url": session.url})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 
 # ----------------------------
@@ -274,30 +321,37 @@ def stripe_webhook():
     payload = request.data
     sig_header = request.headers.get("Stripe-Signature", "")
 
+    # Webhook secret måste finnas i prod. (Om du kör dev kan du sätta en riktig secret i Stripe.)
+    if not STRIPE_WEBHOOK_SECRET:
+        return "STRIPE_WEBHOOK_SECRET missing", 500
+
     try:
-        event = stripe.Webhook.construct_event(
-            payload, sig_header, STRIPE_WEBHOOK_SECRET
-        )
+        event = stripe.Webhook.construct_event(payload, sig_header, STRIPE_WEBHOOK_SECRET)
     except Exception as e:
         print("Webhook verify failed:", e)
         return "Bad Request", 400
 
-    event_type = event["type"]
-    obj = event["data"]["object"]
+    event_type = event.get("type", "")
+    obj = (event.get("data") or {}).get("object") or {}
 
-    def upsert_from_subscription(subscription_id, email_hint=None, customer_id_hint=None):
+    def upsert_from_subscription(subscription_id: str, email_hint: str | None = None, customer_id_hint: str | None = None):
         sub = stripe.Subscription.retrieve(subscription_id)
         status = sub.get("status")
         cpe = sub.get("current_period_end")
         customer_id = sub.get("customer") or customer_id_hint
 
+        # price_id från subscription items
         items = (sub.get("items") or {}).get("data") or []
         price_id = None
-        if items:
-            price_id = items[0]["price"]["id"]
+        if items and isinstance(items, list):
+            try:
+                price_id = items[0].get("price", {}).get("id")
+            except Exception:
+                price_id = None
 
         plan = plan_from_price(price_id)
 
+        # robust email resolve via customer
         email = None
         if customer_id:
             cust = stripe.Customer.retrieve(customer_id)
@@ -305,7 +359,15 @@ def stripe_webhook():
 
         email = (email or email_hint or "").strip().lower()
         if email:
-            upsert_subscription(email, customer_id, subscription_id, status, cpe, plan, price_id)
+            upsert_subscription(
+                email=email,
+                customer_id=customer_id,
+                subscription_id=subscription_id,
+                status=status,
+                current_period_end=int(cpe or 0),
+                plan=plan,
+                price_id=price_id,
+            )
 
     try:
         if event_type == "checkout.session.completed":
@@ -314,7 +376,7 @@ def stripe_webhook():
             customer_id = obj.get("customer")
 
             if subscription_id:
-                upsert_from_subscription(subscription_id, email, customer_id)
+                upsert_from_subscription(subscription_id, email_hint=email, customer_id_hint=customer_id)
 
         elif event_type.startswith("customer.subscription."):
             subscription_id = obj.get("id")
@@ -326,6 +388,7 @@ def stripe_webhook():
             if subscription_id:
                 upsert_from_subscription(subscription_id)
 
+        # Ignorera annat
         return "", 200
 
     except Exception as e:
