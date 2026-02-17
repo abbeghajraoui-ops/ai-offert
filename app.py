@@ -47,7 +47,7 @@ def sbool(key: str, default: bool = False) -> bool:
     val = str(sget(key, str(default))).strip().lower()
     return val in ("1", "true", "yes", "y", "on")
 
-# ✅ Debug är AV som standard. Slå bara på genom att sätta SHOW_DEBUG=true i secrets.
+# ✅ Debug är AV som standard. Slå på med SHOW_DEBUG=true i secrets.
 SHOW_DEBUG = sbool("SHOW_DEBUG", False)
 
 STRIPE_PRICE_ID_STARTER = (sget("STRIPE_PRICE_ID_STARTER") or "").strip()
@@ -58,6 +58,136 @@ BACKEND_BASE_URL = (sget("BACKEND_BASE_URL") or "").rstrip("/")
 APP_API_TOKEN = ((sget("APP_API_TOKEN") or "").strip() or (sget("APP_WEBHOOK_TOKEN") or "").strip())
 APP_BASE_URL = (sget("APP_BASE_URL") or "").rstrip("/")
 OPENAI_API_KEY = (sget("OPENAI_API_KEY") or "").strip()
+
+
+# ----------------------------
+# Safe casting helpers
+# ----------------------------
+def as_text(v) -> str:
+    """Always return a safe string (handles dict/list/None)."""
+    if v is None:
+        return ""
+    if isinstance(v, str):
+        return v
+    if isinstance(v, (dict, list)):
+        try:
+            return json.dumps(v, ensure_ascii=False, indent=2)
+        except Exception:
+            return str(v)
+    return str(v)
+
+def as_list(v) -> list:
+    """Ensure list type. If string -> [string]. If dict -> [json]."""
+    if v is None:
+        return []
+    if isinstance(v, list):
+        return v
+    if isinstance(v, str):
+        s = v.strip()
+        return [s] if s else []
+    if isinstance(v, dict):
+        return [as_text(v)]
+    return [as_text(v)]
+
+def as_int(v, default=0) -> int:
+    try:
+        if v is None:
+            return default
+        if isinstance(v, bool):
+            return default
+        if isinstance(v, (int, float)):
+            return int(v)
+        s = str(v).strip().replace(" ", "")
+        if s == "":
+            return default
+        return int(float(s))
+    except Exception:
+        return default
+
+def normalize_offer(offer: dict, company: str, customer: str, industry: str, include_rot: bool, profile: dict) -> dict:
+    """Normalize AI output so PDF/UI never crashes."""
+    scope_defaults = profile.get("scope_defaults", [])
+    exclusions_defaults = profile.get("exclusions_defaults", [])
+    trust_points_defaults = profile.get("trust_points", [])
+    rot_note_default = profile.get("rot_note", "ROT/RUT kan vara möjligt beroende på arbete. Slutligt avdrag beslutas av Skatteverket.")
+
+    out = dict(offer or {})
+
+    out["title"] = as_text(out.get("title")) or f"Offert – {industry}"
+    out["company"] = as_text(out.get("company")) or company
+    out["customer"] = as_text(out.get("customer")) or customer
+
+    out["summary"] = as_text(out.get("summary"))
+    out["timeline"] = as_text(out.get("timeline"))
+    out["rot_note"] = as_text(out.get("rot_note")) if include_rot else ""
+
+    # Lists
+    out["scope"] = as_list(out.get("scope")) or list(scope_defaults)
+    out["exclusions"] = as_list(out.get("exclusions")) or list(exclusions_defaults)
+    out["trust_points"] = as_list(out.get("trust_points")) or list(trust_points_defaults)
+    out["terms"] = as_list(out.get("terms")) or [
+        "Offerten är giltig i 30 dagar",
+        "Betalningsvillkor: 10 dagar efter slutfört arbete (om inget annat avtalas)",
+        "ÄTA (ändring/tillägg) offereras separat och bekräftas skriftligt"
+    ]
+
+    out["next_steps"] = as_text(out.get("next_steps")) or "Om ni vill gå vidare: svara och bekräfta offerten. Vi återkommer för att boka startdatum."
+
+    # Contact must always be text
+    contact = out.get("contact")
+    if not contact:
+        out["contact"] = f"{out['company']}\nTelefon: \nE-post: "
+    else:
+        out["contact"] = as_text(contact)
+
+    # Pricing normalization
+    pricing = out.get("pricing")
+    if not isinstance(pricing, list):
+        pricing = []
+    cleaned = []
+    for p in pricing[:40]:
+        if not isinstance(p, dict):
+            continue
+        item = as_text(p.get("item"))
+        qty = p.get("qty")
+        unit = as_text(p.get("unit"))
+        unit_price = p.get("unit_price_sek")
+        total = p.get("total_sek")
+
+        # keep numeric-ish
+        qty_s = as_text(qty) if qty is not None else ""
+        unit_price_i = as_int(unit_price, 0)
+        total_i = as_int(total, 0)
+
+        cleaned.append({
+            "item": item,
+            "qty": qty_s,
+            "unit": unit,
+            "unit_price_sek": unit_price_i,
+            "total_sek": total_i
+        })
+
+    if not cleaned:
+        cleaned = [
+            {"item": "Arbete", "qty": "1", "unit": "st", "unit_price_sek": 0, "total_sek": 0},
+            {"item": "Material", "qty": "1", "unit": "st", "unit_price_sek": 0, "total_sek": 0},
+        ]
+    out["pricing"] = cleaned
+
+    # total_sek: always int; if missing, compute sum
+    computed_total = sum(as_int(r.get("total_sek"), 0) for r in out["pricing"])
+    total_in = out.get("total_sek", None)
+    out["total_sek"] = as_int(total_in, computed_total)
+
+    # Fill rot note if include_rot but AI omitted
+    if include_rot and not out["rot_note"]:
+        out["rot_note"] = rot_note_default
+
+    # Ensure strings
+    for k in ("summary", "timeline", "rot_note", "next_steps", "contact"):
+        out[k] = as_text(out.get(k))
+
+    return out
 
 
 # ----------------------------
@@ -331,7 +461,7 @@ rot_note,
 trust_points (lista),
 terms (lista),
 next_steps,
-contact.
+contact (TEXTBLOCK som sträng).
 
 Input:
 Företag: {company}
@@ -376,17 +506,6 @@ Riktlinjer:
         if not isinstance(data, dict):
             return fallback
 
-        data.setdefault("title", f"Offert – {industry}")
-        data.setdefault("company", company)
-        data.setdefault("customer", customer)
-        data.setdefault("scope", scope_defaults[:])
-        data.setdefault("exclusions", exclusions_defaults[:])
-        data.setdefault("pricing", [])
-        data.setdefault("terms", [])
-        data.setdefault("trust_points", trust_points_defaults[:])
-        data.setdefault("rot_note", rot_note_default if include_rot else "")
-        data.setdefault("next_steps", fallback["next_steps"])
-        data.setdefault("contact", fallback["contact"])
         return data
 
     except Exception:
@@ -406,15 +525,15 @@ def build_offer_pdf(offer: dict, industry: str) -> bytes:
     y = height - margin
 
     c.setFont("Helvetica-Bold", 18)
-    c.drawString(x, y, offer.get("title", "Offert"))
+    c.drawString(x, y, as_text(offer.get("title")) or "Offert")
     y -= 7 * mm
 
     c.setFont("Helvetica", 10)
     c.drawString(x, y, f"Datum: {datetime.now().strftime('%Y-%m-%d')}   •   Bransch: {industry}")
     y -= 7 * mm
 
-    company = offer.get("company", "")
-    customer = offer.get("customer", "")
+    company = as_text(offer.get("company"))
+    customer = as_text(offer.get("customer"))
     if company:
         c.drawString(x, y, f"Företag: {company}")
         y -= 5 * mm
@@ -422,7 +541,7 @@ def build_offer_pdf(offer: dict, industry: str) -> bytes:
         c.drawString(x, y, f"Kund: {customer}")
         y -= 8 * mm
 
-    summary = offer.get("summary", "")
+    summary = as_text(offer.get("summary"))
     if summary:
         c.setFont("Helvetica-Bold", 11)
         c.drawString(x, y, "Sammanfattning")
@@ -438,7 +557,7 @@ def build_offer_pdf(offer: dict, industry: str) -> bytes:
         y -= 6 * mm
         c.setFont("Helvetica", 10)
         for item in scope[:28]:
-            y = _draw_bullet(c, str(item), x, y, width - 2 * margin)
+            y = _draw_bullet(c, as_text(item), x, y, width - 2 * margin)
         y -= 2 * mm
 
     exclusions = offer.get("exclusions") or []
@@ -448,10 +567,10 @@ def build_offer_pdf(offer: dict, industry: str) -> bytes:
         y -= 6 * mm
         c.setFont("Helvetica", 10)
         for item in exclusions[:24]:
-            y = _draw_bullet(c, str(item), x, y, width - 2 * margin)
+            y = _draw_bullet(c, as_text(item), x, y, width - 2 * margin)
         y -= 2 * mm
 
-    timeline = offer.get("timeline", "")
+    timeline = as_text(offer.get("timeline"))
     if timeline:
         c.setFont("Helvetica-Bold", 11)
         c.drawString(x, y, "Tidsplan")
@@ -474,12 +593,14 @@ def build_offer_pdf(offer: dict, industry: str) -> bytes:
 
         rows = [["Post", "Antal", "Enhet", "á-pris (SEK)", "Summa (SEK)"]]
         for p in pricing[:30]:
+            if not isinstance(p, dict):
+                continue
             rows.append([
-                str(p.get("item", ""))[:45],
-                str(p.get("qty", "")),
-                str(p.get("unit", "")),
-                str(p.get("unit_price_sek", "")),
-                str(p.get("total_sek", "")),
+                as_text(p.get("item"))[:45],
+                as_text(p.get("qty")),
+                as_text(p.get("unit")),
+                as_text(p.get("unit_price_sek")),
+                as_text(p.get("total_sek")),
             ])
 
         tbl = Table(rows, colWidths=[75 * mm, 18 * mm, 18 * mm, 26 * mm, 26 * mm])
@@ -497,10 +618,10 @@ def build_offer_pdf(offer: dict, industry: str) -> bytes:
 
         if total_sek is not None:
             c.setFont("Helvetica-Bold", 11)
-            c.drawString(x, y, f"Totalt: {total_sek} SEK")
+            c.drawString(x, y, f"Totalt: {as_text(total_sek)} SEK")
             y -= 6 * mm
 
-    rot_note = offer.get("rot_note", "")
+    rot_note = as_text(offer.get("rot_note"))
     if rot_note:
         c.setFont("Helvetica-Bold", 11)
         c.drawString(x, y, "ROT/RUT (information)")
@@ -516,7 +637,7 @@ def build_offer_pdf(offer: dict, industry: str) -> bytes:
         y -= 6 * mm
         c.setFont("Helvetica", 10)
         for t in trust_points[:18]:
-            y = _draw_bullet(c, str(t), x, y, width - 2 * margin)
+            y = _draw_bullet(c, as_text(t), x, y, width - 2 * margin)
         y -= 2 * mm
 
     terms = offer.get("terms") or []
@@ -526,10 +647,10 @@ def build_offer_pdf(offer: dict, industry: str) -> bytes:
         y -= 6 * mm
         c.setFont("Helvetica", 10)
         for t in terms[:22]:
-            y = _draw_bullet(c, str(t), x, y, width - 2 * margin)
+            y = _draw_bullet(c, as_text(t), x, y, width - 2 * margin)
         y -= 2 * mm
 
-    next_steps = offer.get("next_steps", "")
+    next_steps = as_text(offer.get("next_steps"))
     if next_steps:
         c.setFont("Helvetica-Bold", 11)
         c.drawString(x, y, "Nästa steg")
@@ -538,7 +659,7 @@ def build_offer_pdf(offer: dict, industry: str) -> bytes:
         y = _draw_paragraph(c, next_steps, x, y, width - 2 * margin)
         y -= 4 * mm
 
-    contact = offer.get("contact", "")
+    contact = as_text(offer.get("contact"))
     if contact:
         c.setFont("Helvetica-Bold", 11)
         c.drawString(x, y, "Kontakt")
@@ -569,15 +690,17 @@ def build_offer_pdf(offer: dict, industry: str) -> bytes:
 
 
 def _draw_paragraph(c, text, x, y, max_width, line_height=12):
-    words = (text or "").split()
+    text = as_text(text)
+    words = text.split()
     line = ""
     for w in words:
         test = (line + " " + w).strip()
         if c.stringWidth(test, "Helvetica", 10) <= max_width:
             line = test
         else:
-            c.drawString(x, y, line)
-            y -= line_height
+            if line:
+                c.drawString(x, y, line)
+                y -= line_height
             line = w
             if y < 25 * mm:
                 c.showPage()
@@ -602,7 +725,7 @@ st.set_page_config(page_title="Offertly", layout="wide")
 st.title(APP_TITLE)
 st.caption("Skapa säljande och tydliga offerter till privatkunder – med AI + proffsig PDF.")
 
-# Query params feedback (visas för användaren, men utan debug)
+# Query params feedback (utan debug)
 try:
     qp = st.query_params
     if qp.get("success"):
@@ -612,7 +735,7 @@ try:
 except Exception:
     pass
 
-# ✅ Sidebar debug bara om SHOW_DEBUG=true
+# Debug i sidebar endast om SHOW_DEBUG=true
 if SHOW_DEBUG:
     with st.sidebar:
         st.subheader("Systemstatus (debug)")
@@ -647,7 +770,6 @@ def plan_key_to_price_id(plan_key: str) -> str:
         "team": STRIPE_PRICE_ID_TEAM,
     }[plan_key]
 
-
 def go_checkout(email: str, plan_key: str):
     if not APP_BASE_URL:
         st.error("Saknar APP_BASE_URL i secrets.")
@@ -661,7 +783,7 @@ def go_checkout(email: str, plan_key: str):
     }
     ok2, resp2 = ok_or_err(backend_post, "/api/create-checkout-session", payload)
     if not ok2:
-        st.error("Kunde inte skapa betalning. Kontrollera inställningar.")
+        st.error("Kunde inte skapa betalning. Försök igen.")
         if SHOW_DEBUG:
             st.code(str(resp2))
         return
@@ -676,13 +798,11 @@ def go_checkout(email: str, plan_key: str):
     st.success("Öppna Stripe Checkout för att betala.")
     st.link_button("Öppna Stripe Checkout", url, use_container_width=True)
 
-
 def get_status(email: str):
     ok, resp = ok_or_err(backend_get, "/api/status", {"email": email})
     if not ok:
         return False, None, resp
     return True, resp, None
-
 
 def use_free_quote(email: str):
     ok, resp = ok_or_err(backend_post, "/api/use-free-quote", {"email": email})
@@ -827,8 +947,11 @@ with col1:
                         st.code(str(resp_free))
                     st.stop()
 
+            profile = INDUSTRIES.get(industry, {})
             with st.spinner("Genererar offert..."):
-                offer = generate_offer_ai(company, customer, desc, industry=industry, include_rot=include_rot)
+                raw_offer = generate_offer_ai(company, customer, desc, industry=industry, include_rot=include_rot)
+                offer = normalize_offer(raw_offer, company, customer, industry, include_rot, profile)
+
                 st.session_state["offer_data"] = offer
                 st.session_state["offer_pdf"] = build_offer_pdf(offer, industry=industry)
 
@@ -846,13 +969,14 @@ with col2:
     else:
         st.info("Generera en offert så dyker PDF-knappen upp här.")
 
-# ✅ Utkast/JSON visas ENDAST om SHOW_DEBUG=true
+# Utkast visas endast om debug är på
 if SHOW_DEBUG and st.session_state.get("offer_data"):
     st.markdown("### Utkast (granskning)")
     st.json(st.session_state["offer_data"])
 
 if (not active) and free_remaining > 0:
     st.info(f"Du är i testläge. Du har {free_remaining} gratis offerter kvar innan betalning krävs.")
+
 
 
 
@@ -877,6 +1001,7 @@ if (not active) and free_remaining > 0:
 
 
     
+
 
 
 
