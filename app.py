@@ -43,6 +43,13 @@ def sget(key: str, default=""):
     except Exception:
         return os.environ.get(key, default)
 
+def sbool(key: str, default: bool = False) -> bool:
+    val = str(sget(key, str(default))).strip().lower()
+    return val in ("1", "true", "yes", "y", "on")
+
+# ✅ Debug är AV som standard. Slå bara på genom att sätta SHOW_DEBUG=true i secrets.
+SHOW_DEBUG = sbool("SHOW_DEBUG", False)
+
 STRIPE_PRICE_ID_STARTER = (sget("STRIPE_PRICE_ID_STARTER") or "").strip()
 STRIPE_PRICE_ID_PRO = (sget("STRIPE_PRICE_ID_PRO") or "").strip()
 STRIPE_PRICE_ID_TEAM = (sget("STRIPE_PRICE_ID_TEAM") or "").strip()
@@ -106,7 +113,7 @@ INDUSTRIES = {
             "Förberedelse och skydd av ytor",
             "Demontering vid behov",
             "Installation/byte av VVS-komponenter enligt överenskommelse",
-            "Provtryckning/funktionskontroll",
+            "Funktionskontroll",
             "Städning av arbetsområdet"
         ],
         "exclusions_defaults": [
@@ -123,13 +130,13 @@ INDUSTRIES = {
     },
     "El": {
         "scope_defaults": [
-            "Planering och genomgång på plats vid behov",
+            "Planering och genomgång vid behov",
             "Installation/byte av elkomponenter enligt överenskommelse",
             "Mätning/funktionskontroll",
             "Enkel återställning av arbetsområde"
         ],
         "exclusions_defaults": [
-            "Åtgärder på befintlig el som kräver extra felsökning utöver överenskommelse",
+            "Felsökning utöver överenskommelse",
             "Dolda fel i befintlig anläggning",
             "Tillval/ändringar efter start (ÄTA) utan skriftlig överenskommelse"
         ],
@@ -222,13 +229,13 @@ INDUSTRIES = {
     "Städ": {
         "scope_defaults": [
             "Genomgång av önskemål och ytor",
-            "Städning enligt överenskommen checklist",
+            "Städning enligt överenskommen checklista",
             "Kvalitetskontroll efter utfört arbete"
         ],
         "exclusions_defaults": [
-            "Sanering/specialrengöring som kräver särskild utrustning om inte avtalat",
+            "Sanering/specialrengöring om inte avtalat",
             "Skador i underlag/material som påverkar resultatet",
-            "Extra tillval som inte ingår i checklisten (offereras separat)"
+            "Extra tillval utöver checklistan (offereras separat)"
         ],
         "trust_points": [
             "Tydlig checklista – du vet vad som ingår",
@@ -275,20 +282,13 @@ def _extract_json(text: str) -> dict | None:
         return None
 
 
-def generate_offer_ai(
-    company: str,
-    customer: str,
-    description: str,
-    industry: str,
-    include_rot: bool,
-) -> dict:
+def generate_offer_ai(company: str, customer: str, description: str, industry: str, include_rot: bool) -> dict:
     profile = INDUSTRIES.get(industry, {})
     scope_defaults = profile.get("scope_defaults", [])
     exclusions_defaults = profile.get("exclusions_defaults", [])
     trust_points_defaults = profile.get("trust_points", [])
     rot_note_default = profile.get("rot_note", "ROT/RUT kan vara möjligt beroende på arbete. Slutligt avdrag beslutas av Skatteverket.")
 
-    # Fallback – alltid fungerande
     fallback = {
         "title": f"Offert – {industry}",
         "company": company,
@@ -316,26 +316,22 @@ def generate_offer_ai(
     if not (OPENAI_AVAILABLE and OPENAI_API_KEY):
         return fallback
 
-    # Prompt: privatkundsvänligt, säljande och tydligt
     prompt = f"""
-Du är en svensk offertassistent. Du skriver offerter som ska skickas från en hantverks-/konsultfirma till en privatkund.
+Du är en svensk offertassistent. Du skriver offerter som ska skickas från en firma till en privatkund.
 Svara ENDAST som JSON (utan ```). Skriv tydligt, professionellt och tryggt. Undvik onödigt fackspråk.
 
 BRANSCH: {industry}
 
 Returnera JSON med nycklar:
 title, company, customer,
-summary (kort, säljande, tryggt),
-scope (lista: vad ingår),
-exclusions (lista: vad ingår inte),
-timeline (enkel tidsplan),
+summary, scope (lista), exclusions (lista), timeline,
 pricing (lista av {{"item","qty","unit","unit_price_sek","total_sek"}}),
-total_sek (summa av pricing.total_sek),
-rot_note (om relevant),
-trust_points (lista: trygghetsargument),
-terms (lista: korta villkor),
-next_steps (vad kunden gör nu),
-contact (textblock).
+total_sek,
+rot_note,
+trust_points (lista),
+terms (lista),
+next_steps,
+contact.
 
 Input:
 Företag: {company}
@@ -343,11 +339,11 @@ Kund: {customer}
 Beskrivning: {description}
 
 Riktlinjer:
-- Utgå från dessa standardpunkter (anpassa efter beskrivningen):
+- Utgå från standardpunkter men anpassa efter beskrivningen.
   scope_defaults: {json.dumps(scope_defaults, ensure_ascii=False)}
   exclusions_defaults: {json.dumps(exclusions_defaults, ensure_ascii=False)}
   trust_points_defaults: {json.dumps(trust_points_defaults, ensure_ascii=False)}
-- Om pris inte framgår: skapa en enkel prisöversikt med 2–6 rader (arbete/material/resor etc) och använd 0 SEK om du inte kan uppskatta.
+- Om pris inte framgår: skapa en enkel prisöversikt med 2–6 rader och använd 0 SEK om du inte kan uppskatta.
 - total_sek måste vara exakt summan av pricing.total_sek.
 - ROT/RUT: {"inkludera en tydlig rot_note" if include_rot else "sätt rot_note till tom sträng"}.
 """.strip()
@@ -380,7 +376,6 @@ Riktlinjer:
         if not isinstance(data, dict):
             return fallback
 
-        # Defaults / safety
         data.setdefault("title", f"Offert – {industry}")
         data.setdefault("company", company)
         data.setdefault("customer", customer)
@@ -410,7 +405,6 @@ def build_offer_pdf(offer: dict, industry: str) -> bytes:
     x = margin
     y = height - margin
 
-    # Header
     c.setFont("Helvetica-Bold", 18)
     c.drawString(x, y, offer.get("title", "Offert"))
     y -= 7 * mm
@@ -428,7 +422,6 @@ def build_offer_pdf(offer: dict, industry: str) -> bytes:
         c.drawString(x, y, f"Kund: {customer}")
         y -= 8 * mm
 
-    # Summary
     summary = offer.get("summary", "")
     if summary:
         c.setFont("Helvetica-Bold", 11)
@@ -438,7 +431,6 @@ def build_offer_pdf(offer: dict, industry: str) -> bytes:
         y = _draw_paragraph(c, summary, x, y, width - 2 * margin)
         y -= 4 * mm
 
-    # Scope
     scope = offer.get("scope") or []
     if scope:
         c.setFont("Helvetica-Bold", 11)
@@ -449,7 +441,6 @@ def build_offer_pdf(offer: dict, industry: str) -> bytes:
             y = _draw_bullet(c, str(item), x, y, width - 2 * margin)
         y -= 2 * mm
 
-    # Exclusions
     exclusions = offer.get("exclusions") or []
     if exclusions:
         c.setFont("Helvetica-Bold", 11)
@@ -460,7 +451,6 @@ def build_offer_pdf(offer: dict, industry: str) -> bytes:
             y = _draw_bullet(c, str(item), x, y, width - 2 * margin)
         y -= 2 * mm
 
-    # Timeline
     timeline = offer.get("timeline", "")
     if timeline:
         c.setFont("Helvetica-Bold", 11)
@@ -470,7 +460,6 @@ def build_offer_pdf(offer: dict, industry: str) -> bytes:
         y = _draw_paragraph(c, timeline, x, y, width - 2 * margin)
         y -= 4 * mm
 
-    # Pricing table
     pricing = offer.get("pricing") or []
     total_sek = offer.get("total_sek")
 
@@ -511,7 +500,6 @@ def build_offer_pdf(offer: dict, industry: str) -> bytes:
             c.drawString(x, y, f"Totalt: {total_sek} SEK")
             y -= 6 * mm
 
-    # ROT/RUT
     rot_note = offer.get("rot_note", "")
     if rot_note:
         c.setFont("Helvetica-Bold", 11)
@@ -521,7 +509,6 @@ def build_offer_pdf(offer: dict, industry: str) -> bytes:
         y = _draw_paragraph(c, rot_note, x, y, width - 2 * margin)
         y -= 4 * mm
 
-    # Trust
     trust_points = offer.get("trust_points") or []
     if trust_points:
         c.setFont("Helvetica-Bold", 11)
@@ -532,7 +519,6 @@ def build_offer_pdf(offer: dict, industry: str) -> bytes:
             y = _draw_bullet(c, str(t), x, y, width - 2 * margin)
         y -= 2 * mm
 
-    # Terms
     terms = offer.get("terms") or []
     if terms:
         c.setFont("Helvetica-Bold", 11)
@@ -543,7 +529,6 @@ def build_offer_pdf(offer: dict, industry: str) -> bytes:
             y = _draw_bullet(c, str(t), x, y, width - 2 * margin)
         y -= 2 * mm
 
-    # Next steps
     next_steps = offer.get("next_steps", "")
     if next_steps:
         c.setFont("Helvetica-Bold", 11)
@@ -553,7 +538,6 @@ def build_offer_pdf(offer: dict, industry: str) -> bytes:
         y = _draw_paragraph(c, next_steps, x, y, width - 2 * margin)
         y -= 4 * mm
 
-    # Contact
     contact = offer.get("contact", "")
     if contact:
         c.setFont("Helvetica-Bold", 11)
@@ -563,7 +547,6 @@ def build_offer_pdf(offer: dict, industry: str) -> bytes:
         y = _draw_paragraph(c, contact, x, y, width - 2 * margin)
         y -= 4 * mm
 
-    # Acceptance block
     if y < 55 * mm:
         c.showPage()
         y = height - margin
@@ -619,7 +602,7 @@ st.set_page_config(page_title="Offertly", layout="wide")
 st.title(APP_TITLE)
 st.caption("Skapa säljande och tydliga offerter till privatkunder – med AI + proffsig PDF.")
 
-# Query params feedback
+# Query params feedback (visas för användaren, men utan debug)
 try:
     qp = st.query_params
     if qp.get("success"):
@@ -629,17 +612,18 @@ try:
 except Exception:
     pass
 
-# Sidebar debug
-with st.sidebar:
-    st.subheader("Systemstatus (debug)")
-    st.write("BACKEND_BASE_URL:", "✅" if BACKEND_BASE_URL else "❌")
-    st.write("APP_API_TOKEN:", "✅" if APP_API_TOKEN else "❌")
-    st.write("Price IDs:", "✅" if all([STRIPE_PRICE_ID_STARTER, STRIPE_PRICE_ID_PRO, STRIPE_PRICE_ID_TEAM]) else "❌")
-    st.write("OpenAI:", "✅" if (OPENAI_API_KEY and OPENAI_AVAILABLE) else "⚠️ (fallback)")
-    st.divider()
-    if st.button("Nollställ (session)"):
-        st.session_state.clear()
-        st.rerun()
+# ✅ Sidebar debug bara om SHOW_DEBUG=true
+if SHOW_DEBUG:
+    with st.sidebar:
+        st.subheader("Systemstatus (debug)")
+        st.write("BACKEND_BASE_URL:", "✅" if BACKEND_BASE_URL else "❌")
+        st.write("APP_API_TOKEN:", "✅" if APP_API_TOKEN else "❌")
+        st.write("Price IDs:", "✅" if all([STRIPE_PRICE_ID_STARTER, STRIPE_PRICE_ID_PRO, STRIPE_PRICE_ID_TEAM]) else "❌")
+        st.write("OpenAI:", "✅" if (OPENAI_API_KEY and OPENAI_AVAILABLE) else "⚠️ (fallback)")
+        st.divider()
+        if st.button("Nollställ (session)"):
+            st.session_state.clear()
+            st.rerun()
 
 # Session state
 if "selected_plan" not in st.session_state:
@@ -666,7 +650,7 @@ def plan_key_to_price_id(plan_key: str) -> str:
 
 def go_checkout(email: str, plan_key: str):
     if not APP_BASE_URL:
-        st.error("Sätt APP_BASE_URL i Streamlit secrets (t.ex. https://din-app.streamlit.app).")
+        st.error("Saknar APP_BASE_URL i secrets.")
         return
 
     payload = {
@@ -677,12 +661,16 @@ def go_checkout(email: str, plan_key: str):
     }
     ok2, resp2 = ok_or_err(backend_post, "/api/create-checkout-session", payload)
     if not ok2:
-        st.error(f"Kunde inte skapa checkout: {resp2}")
+        st.error("Kunde inte skapa betalning. Kontrollera inställningar.")
+        if SHOW_DEBUG:
+            st.code(str(resp2))
         return
 
     url = (resp2 or {}).get("url")
     if not url:
-        st.error("Ingen checkout-URL returnerades.")
+        st.error("Kunde inte starta betalning.")
+        if SHOW_DEBUG:
+            st.json(resp2)
         return
 
     st.success("Öppna Stripe Checkout för att betala.")
@@ -719,21 +707,18 @@ b3.write("✅ PDF med godkännande längst ner")
 
 st.divider()
 
-# Branschval + “prova”
 left, right = st.columns([1.15, 0.85], gap="large")
 
 with left:
     st.markdown("### 1) Välj bransch")
-    st.session_state["industry"] = st.selectbox(
-        "Bransch",
-        options=industry_options(),
-        index=industry_options().index(st.session_state["industry"]) if st.session_state["industry"] in industry_options() else 0
-    )
+    options = industry_options()
+    current = st.session_state["industry"] if st.session_state["industry"] in options else options[0]
+    st.session_state["industry"] = st.selectbox("Bransch", options=options, index=options.index(current))
+
     st.session_state["include_rot"] = st.toggle("Visa ROT/RUT-information i offerten", value=st.session_state["include_rot"])
 
     st.markdown("### 2) Skriv din email")
     st.session_state["email"] = st.text_input("Email", value=st.session_state["email"], placeholder="din@email.se").strip().lower()
-
     st.caption("Du kan skapa **3 testofferter gratis**. Därefter behöver du välja paket och betala.")
 
 with right:
@@ -743,7 +728,7 @@ with right:
     st.write("**Team** – 1 200 kr/mån (3–10 användare)")
     st.divider()
     st.markdown("### Trygg betalning")
-    st.write("Betalning via Stripe. Kvitto skickas av Stripe till email (enligt din Stripe-inställning för receipts).")
+    st.write("Betalning via Stripe. Kvitto skickas av Stripe till din email (enligt dina Stripe-inställningar).")
 
 email = st.session_state.get("email", "").strip().lower()
 industry = st.session_state.get("industry", "VVS")
@@ -754,23 +739,22 @@ if not email:
     st.stop()
 
 if not APP_API_TOKEN:
-    st.error("APP_API_TOKEN saknas i Streamlit secrets (eller APP_WEBHOOK_TOKEN).")
+    st.error("Saknar APP_API_TOKEN i secrets.")
     st.stop()
 
-# Hämta status från backend (aktiv plan + free remaining)
 ok, status, err = get_status(email)
 if not ok:
-    st.error(f"Backend error: {err}")
+    st.error("Kan inte kontakta servern just nu. Försök igen strax.")
+    if SHOW_DEBUG:
+        st.code(str(err))
     st.stop()
 
 active = bool(status.get("active"))
 plan = status.get("plan")
-free_used = int(status.get("free_used") or 0)
 free_remaining = int(status.get("free_remaining") or 0)
 
 st.divider()
 
-# Status-rad
 s1, s2, s3 = st.columns(3)
 s1.metric("Gratis offerter kvar", free_remaining)
 s2.metric("Din plan", (plan or "Ingen (testläge)") if active else "Ingen (testläge)")
@@ -835,15 +819,12 @@ with col1:
         if not (company and customer and desc):
             st.error("Fyll i företagsnamn, kundnamn och beskrivning.")
         else:
-            # Om inte aktiv plan: konsumera en gratis offert (max 3)
             if not active:
                 ok_free, resp_free = use_free_quote(email)
                 if not ok_free:
-                    # 402 från backend = free_limit_reached
-                    if "402" in str(resp_free) or "free_limit_reached" in str(resp_free):
-                        st.error("Du har nått gränsen för 3 gratis testofferter. Välj paket för att fortsätta.")
-                        st.stop()
-                    st.error(f"Kunde inte registrera testoffert: {resp_free}")
+                    st.error("Du har nått gränsen för testofferter. Välj paket för att fortsätta.")
+                    if SHOW_DEBUG:
+                        st.code(str(resp_free))
                     st.stop()
 
             with st.spinner("Genererar offert..."):
@@ -851,21 +832,13 @@ with col1:
                 st.session_state["offer_data"] = offer
                 st.session_state["offer_pdf"] = build_offer_pdf(offer, industry=industry)
 
-                # Uppdatera status i UI efter att gratisoffert dragits
-                ok2, status2, err2 = get_status(email)
-                if ok2 and status2:
-                    free_remaining = int(status2.get("free_remaining") or free_remaining)
-
-offer_data = st.session_state.get("offer_data")
-offer_pdf = st.session_state.get("offer_pdf")
-
 with col2:
     st.markdown("### PDF")
-    if offer_pdf:
+    if st.session_state.get("offer_pdf"):
         filename = f"offert_{(customer or 'kund').replace(' ', '_')}_{datetime.now().strftime('%Y%m%d_%H%M')}.pdf"
         st.download_button(
             "Ladda ner offert (PDF)",
-            data=offer_pdf,
+            data=st.session_state["offer_pdf"],
             file_name=filename,
             mime="application/pdf",
             use_container_width=True
@@ -873,16 +846,14 @@ with col2:
     else:
         st.info("Generera en offert så dyker PDF-knappen upp här.")
 
-# Visa utkast
-if offer_data:
+# ✅ Utkast/JSON visas ENDAST om SHOW_DEBUG=true
+if SHOW_DEBUG and st.session_state.get("offer_data"):
     st.markdown("### Utkast (granskning)")
-    st.json(offer_data)
-else:
-    st.caption("När du genererar en offert visas utkastet här.")
+    st.json(st.session_state["offer_data"])
 
-# Extra: CTA om de är i testläge och fortfarande har gratis kvar
-if not active and free_remaining > 0:
+if (not active) and free_remaining > 0:
     st.info(f"Du är i testläge. Du har {free_remaining} gratis offerter kvar innan betalning krävs.")
+
 
 
 
@@ -906,6 +877,7 @@ if not active and free_remaining > 0:
 
 
     
+
 
 
 
