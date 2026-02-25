@@ -17,15 +17,52 @@ from reportlab.lib import colors
 from reportlab.pdfgen import canvas
 from reportlab.platypus import Table, TableStyle
 
-# AI (OpenAI) – robust import (nya + gamla SDK)
+# ==============================
+# PRODUKTIONSLÄGE – DÖLJ STREAMLIT UI (Share/GitHub/Menu/Footer)
+# ==============================
+st.set_page_config(
+    page_title="Offertly",
+    page_icon="📄",
+    layout="wide",
+    initial_sidebar_state="collapsed",
+)
+
+st.markdown(
+    """
+<style>
+/* Top-right toolbar (Share, GitHub, Edit etc) */
+div[data-testid="stToolbar"] {visibility: hidden; height: 0; position: fixed;}
+
+/* Hamburger menu */
+#MainMenu {visibility: hidden;}
+
+/* Footer & header */
+footer {visibility: hidden;}
+header {visibility: hidden;}
+
+/* Deploy button */
+.stDeployButton {display: none;}
+
+/* Lite snyggare toppmarginal */
+.block-container {padding-top: 2.2rem;}
+</style>
+""",
+    unsafe_allow_html=True,
+)
+
+# ============================
+# AI (OpenAI) – robust import
+# ============================
 OPENAI_AVAILABLE = False
 try:
     from openai import OpenAI
+
     OPENAI_AVAILABLE = True
     _OPENAI_MODE = "new"
 except Exception:
     try:
-        import openai
+        import openai  # type: ignore
+
         OPENAI_AVAILABLE = True
         _OPENAI_MODE = "old"
     except Exception:
@@ -52,7 +89,6 @@ SHOW_DEBUG = sbool("SHOW_DEBUG", False)  # debug OFF default
 
 BACKEND_BASE_URL = (sget("BACKEND_BASE_URL") or "").rstrip("/")
 APP_API_TOKEN = ((sget("APP_API_TOKEN") or "").strip() or (sget("APP_WEBHOOK_TOKEN") or "").strip())
-
 APP_BASE_URL = (sget("APP_BASE_URL") or "").rstrip("/")
 
 STRIPE_PRICE_ID_STARTER = (sget("STRIPE_PRICE_ID_STARTER") or "").strip()
@@ -167,17 +203,17 @@ INDUSTRIES = {
             "Demontering vid behov",
             "Installation/byte av VVS-komponenter enligt överenskommelse",
             "Funktionskontroll",
-            "Städning av arbetsområdet"
+            "Städning av arbetsområdet",
         ],
         "exclusions_defaults": [
             "Dolda fel i väggar/golv (t.ex. fuktskador/rördragning som inte syns)",
             "Åtgärder utanför överenskommet arbetsområde",
-            "Tillval/ändringar efter start (ÄTA) utan skriftlig överenskommelse"
+            "Tillval/ändringar efter start (ÄTA) utan skriftlig överenskommelse",
         ],
         "trust_points": [
             "Tydlig omfattning – du vet vad du får",
             "ÄTA hanteras skriftligt innan arbete utförs",
-            "Vi håller dig uppdaterad under arbetets gång"
+            "Vi håller dig uppdaterad under arbetets gång",
         ],
     },
     "El": {
@@ -185,17 +221,17 @@ INDUSTRIES = {
             "Planering och genomgång vid behov",
             "Installation/byte av elkomponenter enligt överenskommelse",
             "Mätning/funktionskontroll",
-            "Enkel återställning av arbetsområde"
+            "Enkel återställning av arbetsområde",
         ],
         "exclusions_defaults": [
             "Felsökning utöver överenskommelse",
             "Dolda fel i befintlig anläggning",
-            "Tillval/ändringar efter start (ÄTA) utan skriftlig överenskommelse"
+            "Tillval/ändringar efter start (ÄTA) utan skriftlig överenskommelse",
         ],
         "trust_points": [
             "Tydlig offert – inga överraskningar",
             "ÄTA hanteras skriftligt innan arbete utförs",
-            "Säkerhet och kvalitet i fokus"
+            "Säkerhet och kvalitet i fokus",
         ],
     },
     "Snickeri": {
@@ -204,17 +240,17 @@ INDUSTRIES = {
             "Rivning/montering enligt överenskommelse",
             "Material och montage",
             "Finjustering och genomgång",
-            "Städning av arbetsområdet"
+            "Städning av arbetsområdet",
         ],
         "exclusions_defaults": [
             "Dolda skador i bärande konstruktioner",
             "Arbeten som kräver bygglov/extra ritningar utöver överenskommelse",
-            "Tillval/ändringar efter start (ÄTA) utan skriftlig överenskommelse"
+            "Tillval/ändringar efter start (ÄTA) utan skriftlig överenskommelse",
         ],
         "trust_points": [
             "Tydlig plan och kommunikation",
             "ÄTA hanteras skriftligt innan arbete utförs",
-            "Noggrann slutgenomgång innan avslut"
+            "Noggrann slutgenomgång innan avslut",
         ],
     },
     "Murning": {
@@ -222,17 +258,17 @@ INDUSTRIES = {
             "Förberedelse av underlag",
             "Murning/putsning enligt överenskommelse",
             "Avjämning och kontroll av ytor",
-            "Städning av arbetsområdet"
+            "Städning av arbetsområdet",
         ],
         "exclusions_defaults": [
             "Dolda skador/fuktproblem i underlag",
             "Extra armering/åtgärder utöver överenskommelse",
-            "Tillval/ändringar efter start (ÄTA) utan skriftlig överenskommelse"
+            "Tillval/ändringar efter start (ÄTA) utan skriftlig överenskommelse",
         ],
         "trust_points": [
             "Tydlig omfattning och materialval",
             "ÄTA hanteras skriftligt innan arbete utförs",
-            "Slutkontroll av ytor innan avslut"
+            "Slutkontroll av ytor innan avslut",
         ],
     },
     "Plattsättning": {
@@ -241,17 +277,17 @@ INDUSTRIES = {
             "Underarbete/avjämning vid behov",
             "Sättning av kakel/klinker enligt överenskommelse",
             "Fogning och genomgång",
-            "Städning av arbetsområdet"
+            "Städning av arbetsområdet",
         ],
         "exclusions_defaults": [
             "Dolda fel i underlag/konstruktion",
             "Tätskikt/extra underarbete utöver överenskommelse",
-            "Tillval/ändringar efter start (ÄTA) utan skriftlig överenskommelse"
+            "Tillval/ändringar efter start (ÄTA) utan skriftlig överenskommelse",
         ],
         "trust_points": [
             "Tydlig offert med omfattning och val",
             "ÄTA hanteras skriftligt innan arbete utförs",
-            "Vi stämmer av vid eventuella avvikelser"
+            "Vi stämmer av vid eventuella avvikelser",
         ],
     },
     "Golv": {
@@ -260,34 +296,34 @@ INDUSTRIES = {
             "Rivning av befintligt golv vid behov",
             "Läggning av nytt golv enligt överenskommelse",
             "Lister/avslut vid behov",
-            "Städning av arbetsområdet"
+            "Städning av arbetsområdet",
         ],
         "exclusions_defaults": [
             "Dolda fel i undergolv/konstruktion",
             "Extra spackling/avjämning utöver överenskommelse",
-            "Tillval/ändringar efter start (ÄTA) utan skriftlig överenskommelse"
+            "Tillval/ändringar efter start (ÄTA) utan skriftlig överenskommelse",
         ],
         "trust_points": [
             "Tydlig plan för utförande",
             "ÄTA hanteras skriftligt innan arbete utförs",
-            "Slutgenomgång innan avslut"
+            "Slutgenomgång innan avslut",
         ],
     },
     "Städ": {
         "scope_defaults": [
             "Genomgång av önskemål och ytor",
             "Städning enligt överenskommen checklista",
-            "Kvalitetskontroll efter utfört arbete"
+            "Kvalitetskontroll efter utfört arbete",
         ],
         "exclusions_defaults": [
             "Sanering/specialrengöring om inte avtalat",
             "Skador i underlag/material som påverkar resultatet",
-            "Extra tillval utöver checklistan (offereras separat)"
+            "Extra tillval utöver checklistan (offereras separat)",
         ],
         "trust_points": [
             "Tydlig checklista – du vet vad som ingår",
             "Vi stämmer av efteråt",
-            "Extra önskemål hanteras separat och tydligt"
+            "Extra önskemål hanteras separat och tydligt",
         ],
     },
     "Arkitekt/Ingenjör/Konstruktör": {
@@ -295,17 +331,17 @@ INDUSTRIES = {
             "Behovsanalys och genomgång av underlag",
             "Förslag/ritningar/beräkningar enligt överenskommelse",
             "Avstämning och revidering (antal enligt offert)",
-            "Leverans av slutunderlag"
+            "Leverans av slutunderlag",
         ],
         "exclusions_defaults": [
             "Myndighetskontakter/extra handlingar utöver överenskommelse",
             "Extra revisioner utöver överenskommen omfattning",
-            "Ändringar i projektets grundförutsättningar (offereras separat)"
+            "Ändringar i projektets grundförutsättningar (offereras separat)",
         ],
         "trust_points": [
             "Tydliga leveranser och avstämningspunkter",
             "Ändringar hanteras strukturerat och skriftligt",
-            "Du får underlag som är lätt att gå vidare med"
+            "Du får underlag som är lätt att gå vidare med",
         ],
     },
 }
@@ -345,14 +381,16 @@ def calc_pricing(rows: list[dict], rot_enabled: bool, rot_rate: float):
 
         total = int(round(qty * unit_price))
 
-        cleaned.append({
-            "item": item,
-            "qty": qty,
-            "unit": unit,
-            "unit_price_sek": unit_price,
-            "total_sek": total,
-            "kind": kind,
-        })
+        cleaned.append(
+            {
+                "item": item,
+                "qty": qty,
+                "unit": unit,
+                "unit_price_sek": unit_price,
+                "total_sek": total,
+                "kind": kind,
+            }
+        )
 
         if kind == "arbete":
             labor_sum += total
@@ -396,7 +434,7 @@ def generate_offer_ai(company: str, customer: str, description: str, industry: s
         "terms": [
             "Offerten är giltig i 30 dagar",
             "Betalningsvillkor: 10 dagar efter slutfört arbete (om inget annat avtalas)",
-            "ÄTA (ändring/tillägg) offereras separat och bekräftas skriftligt"
+            "ÄTA (ändring/tillägg) offereras separat och bekräftas skriftligt",
         ],
         "next_steps": "Om ni vill gå vidare: svara och bekräfta offerten. Vi återkommer för att boka startdatum och gå igenom val/tillval.",
         "contact": f"{company}\nTelefon: \nE-post: ",
@@ -462,10 +500,10 @@ ROT/RUT: {"rot_note ska förklara att det är preliminärt inräknat" if include
         if not isinstance(data, dict):
             data = fallback
 
-        # Hard normalize
         out = dict(fallback)
         out.update(data)
 
+        # Normalize
         out["title"] = as_text(out.get("title")) or fallback["title"]
         out["summary"] = as_text(out.get("summary")) or fallback["summary"]
         out["scope"] = as_list(out.get("scope")) or fallback["scope"]
@@ -479,7 +517,6 @@ ROT/RUT: {"rot_note ska förklara att det är preliminärt inräknat" if include
 
         out["company"] = company
         out["customer"] = customer
-
         return out
 
     except Exception:
@@ -617,23 +654,29 @@ def build_offer_pdf(offer: dict, industry: str, include_rot: bool) -> bytes:
         rows = [["Post", "Antal", "Enhet", "á-pris (SEK)", "Summa (SEK)"]]
         for p in pricing[:40]:
             p = p or {}
-            rows.append([
-                as_text(p.get("item"))[:50],
-                as_text(p.get("qty")),
-                as_text(p.get("unit")),
-                as_text(p.get("unit_price_sek")),
-                as_text(p.get("total_sek")),
-            ])
+            rows.append(
+                [
+                    as_text(p.get("item"))[:50],
+                    as_text(p.get("qty")),
+                    as_text(p.get("unit")),
+                    as_text(p.get("unit_price_sek")),
+                    as_text(p.get("total_sek")),
+                ]
+            )
 
         tbl = Table(rows, colWidths=[78 * mm, 18 * mm, 18 * mm, 25 * mm, 25 * mm])
-        tbl.setStyle(TableStyle([
-            ("BACKGROUND", (0, 0), (-1, 0), colors.lightgrey),
-            ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
-            ("GRID", (0, 0), (-1, -1), 0.25, colors.grey),
-            ("FONTNAME", (0, 1), (-1, -1), "Helvetica"),
-            ("FONTSIZE", (0, 0), (-1, -1), 9),
-            ("VALIGN", (0, 0), (-1, -1), "TOP"),
-        ]))
+        tbl.setStyle(
+            TableStyle(
+                [
+                    ("BACKGROUND", (0, 0), (-1, 0), colors.lightgrey),
+                    ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+                    ("GRID", (0, 0), (-1, -1), 0.25, colors.grey),
+                    ("FONTNAME", (0, 1), (-1, -1), "Helvetica"),
+                    ("FONTSIZE", (0, 0), (-1, -1), 9),
+                    ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                ]
+            )
+        )
         w, h = tbl.wrapOn(c, width - 2 * margin, y)
         tbl.drawOn(c, x, y - h)
         y = y - h - 6 * mm
@@ -733,10 +776,9 @@ def build_offer_pdf(offer: dict, industry: str, include_rot: bool) -> bytes:
 
 
 # ============================
-# Backend endpoints wrappers
+# Backend wrappers
 # ============================
 def get_status(email: str):
-    # expected: {"active": bool, "plan": "...", "free_remaining": int}
     ok, resp = ok_or_err(backend_get, "/api/status", {"email": email})
     if not ok:
         return False, None, resp
@@ -749,11 +791,12 @@ def use_free_quote(email: str):
     return True, resp
 
 def plan_key_to_price_id(plan_key: str) -> str:
-    return {
+    mapping = {
         "starter": STRIPE_PRICE_ID_STARTER,
         "pro": STRIPE_PRICE_ID_PRO,
         "team": STRIPE_PRICE_ID_TEAM,
-    }[plan_key]
+    }
+    return mapping.get(plan_key, "")
 
 def go_checkout(email: str, plan_key: str):
     if not APP_BASE_URL:
@@ -790,9 +833,8 @@ def go_checkout(email: str, plan_key: str):
 
 
 # ============================
-# Streamlit UI
+# UI
 # ============================
-st.set_page_config(page_title="Offertly", layout="wide")
 st.title(APP_TITLE)
 st.caption("Skapa säljande och tydliga offerter till privatkunder – med AI + proffsig PDF.")
 
@@ -816,13 +858,16 @@ st.session_state.setdefault("offer_pdf", None)
 st.session_state.setdefault("offer_data", None)
 st.session_state.setdefault("selected_plan", None)
 
-# Debug sidebar
+# Optional debug sidebar (only if SHOW_DEBUG=true)
 if SHOW_DEBUG:
     with st.sidebar:
         st.subheader("Systemstatus (debug)")
         st.write("BACKEND_BASE_URL:", "✅" if BACKEND_BASE_URL else "❌")
         st.write("APP_API_TOKEN:", "✅" if APP_API_TOKEN else "❌")
-        st.write("Stripe Price IDs:", "✅" if all([STRIPE_PRICE_ID_STARTER, STRIPE_PRICE_ID_PRO, STRIPE_PRICE_ID_TEAM]) else "❌")
+        st.write(
+            "Stripe Price IDs:",
+            "✅" if all([STRIPE_PRICE_ID_STARTER, STRIPE_PRICE_ID_PRO, STRIPE_PRICE_ID_TEAM]) else "❌",
+        )
         st.write("OpenAI:", "✅" if (OPENAI_AVAILABLE and OPENAI_API_KEY) else "⚠️ (fallback)")
         st.divider()
         if st.button("Nollställ session"):
@@ -853,12 +898,14 @@ with left:
 
     st.session_state["include_rot"] = st.toggle(
         "Räkna in ROT/RUT (preliminärt) i totalsumman",
-        value=st.session_state["include_rot"]
+        value=st.session_state["include_rot"],
     )
-    st.caption(f"ROT/RUT beräknas som {int(ROT_RATE_DEFAULT*100)}% på rader markerade som **arbete**.")
+    st.caption(f"ROT/RUT beräknas som {int(ROT_RATE_DEFAULT * 100)}% på rader markerade som **arbete**.")
 
     st.markdown("### 2) Skriv din email")
-    st.session_state["email"] = st.text_input("Email", value=st.session_state["email"], placeholder="din@email.se").strip().lower()
+    st.session_state["email"] = st.text_input(
+        "Email", value=st.session_state["email"], placeholder="din@email.se"
+    ).strip().lower()
     st.caption("Du kan skapa **3 testofferter gratis**. Därefter behöver du välja paket och betala.")
 
 with right:
@@ -889,9 +936,9 @@ if not ok:
         st.code(str(err))
     st.stop()
 
-active = bool(status.get("active"))
-plan = status.get("plan")
-free_remaining = to_int(status.get("free_remaining"), 0)
+active = bool((status or {}).get("active"))
+plan = (status or {}).get("plan")
+free_remaining = to_int((status or {}).get("free_remaining"), 0)
 
 st.divider()
 
@@ -900,7 +947,7 @@ s1.metric("Gratis offerter kvar", free_remaining)
 s2.metric("Din plan", (plan or "Ingen (testläge)") if active else "Ingen (testläge)")
 s3.metric("Status", "Aktiv ✅" if active else "Testläge 🧪")
 
-# Paywall when trials exhausted
+# Paywall
 if (not active) and free_remaining <= 0:
     st.warning("Du har använt dina 3 gratis testofferter. Välj paket för att fortsätta.")
     cols = st.columns(3)
@@ -944,14 +991,13 @@ customer = st.text_input("Kundens namn", value="")
 desc = st.text_area("Beskrivning (vad ska göras?)", height=140)
 
 st.markdown("### Prisrader (du fyller i – Offertly gissar inte)")
-st.caption("Rader kan lämnas tomma. ROT/RUT räknas bara på rader som är **arbete**. Avfallshantering finns som standardrad.")
+st.caption("ROT/RUT räknas bara på rader markerade som **arbete**. Avfallshantering finns som standardrad.")
 
-# Always ensure defaults exist
+# Ensure defaults exist
 if not isinstance(st.session_state["price_rows"], list) or len(st.session_state["price_rows"]) == 0:
     st.session_state["price_rows"] = list(DEFAULT_PRICE_ROWS)
 
 df = pd.DataFrame(st.session_state["price_rows"])
-# Ensure columns exist even if df is empty
 for col in ["item", "qty", "unit", "unit_price_sek", "kind"]:
     if col not in df.columns:
         df[col] = None
@@ -969,6 +1015,8 @@ df = st.data_editor(
     },
     hide_index=True,
 )
+
+# Sanera editor-data (tar bort None)
 st.session_state["price_rows"] = df.fillna("").to_dict(orient="records")
 
 st.markdown("### Material som ingår (visa tydligt för privatkunden)")
@@ -976,14 +1024,17 @@ st.session_state["materials_included"] = st.text_area(
     "Lista material / produktval",
     value=st.session_state["materials_included"],
     height=120,
-    placeholder="Exempel:\n- Gipsskivor\n- Regelvirke\n- Skruv/spackel\n- Tätskikt (vid våtrum)\n- Kakel/klinker (om valt)\n- Fog/lim\n\nSkriv 'Kundens val' om kunden står för vissa produkter."
+    placeholder=(
+        "Exempel:\n- Gipsskivor\n- Regelvirke\n- Skruv/spackel\n- Tätskikt (vid våtrum)\n"
+        "- Kakel/klinker (om valt)\n- Fog/lim\n\nSkriv 'Kundens val' om kunden står för vissa produkter."
+    ),
 )
 
-# Show live totals preview (nice + safe)
+# Live totals preview
 pricing_preview, labor_sum, material_sum, other_sum, rot_amount, total_before, total_after = calc_pricing(
     st.session_state["price_rows"],
     rot_enabled=include_rot,
-    rot_rate=ROT_RATE_DEFAULT
+    rot_rate=ROT_RATE_DEFAULT,
 )
 
 p1, p2, p3, p4 = st.columns(4)
@@ -1011,18 +1062,15 @@ with col1:
                         st.code(str(resp_free))
                     st.stop()
 
-            # Always calc from current rows
             pricing, labor_sum, material_sum, other_sum, rot_amount, total_before, total_after = calc_pricing(
                 st.session_state["price_rows"],
                 rot_enabled=include_rot,
-                rot_rate=ROT_RATE_DEFAULT
+                rot_rate=ROT_RATE_DEFAULT,
             )
 
-            # AI offer (text only)
             with st.spinner("Genererar offert..."):
                 ai = generate_offer_ai(company, customer, desc, industry=industry, include_rot=include_rot)
 
-            # Build final offer dict
             offer = dict(ai)
             offer["company"] = company
             offer["customer"] = customer
@@ -1037,13 +1085,12 @@ with col1:
 
             if include_rot:
                 offer["rot_note"] = (
-                    f"ROT/RUT är preliminärt inräknat med {int(ROT_RATE_DEFAULT*100)}% på arbetskostnaden. "
+                    f"ROT/RUT är preliminärt inräknat med {int(ROT_RATE_DEFAULT * 100)}% på arbetskostnaden. "
                     "Slutligt avdrag fastställs av Skatteverket och kan påverka slutsumman."
                 )
             else:
                 offer["rot_note"] = ""
 
-            # PDF
             st.session_state["offer_data"] = offer
             st.session_state["offer_pdf"] = build_offer_pdf(offer, industry=industry, include_rot=include_rot)
 
@@ -1056,7 +1103,7 @@ with col2:
             data=st.session_state["offer_pdf"],
             file_name=filename,
             mime="application/pdf",
-            use_container_width=True
+            use_container_width=True,
         )
     else:
         st.info("Generera en offert så dyker PDF-knappen upp här.")
@@ -1086,7 +1133,6 @@ if (not active) and free_remaining > 0:
 
 
 
-
  
 
 
@@ -1095,6 +1141,7 @@ if (not active) and free_remaining > 0:
 
 
     
+
 
 
 
