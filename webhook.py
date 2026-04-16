@@ -1,6 +1,5 @@
 import os
 import time
-import json
 import sqlite3
 from functools import wraps
 
@@ -28,6 +27,7 @@ DB_PATH = os.environ.get("DB_PATH", "offertly.db")
 
 if not STRIPE_SECRET_KEY:
     print("WARN: STRIPE_SECRET_KEY missing")
+
 stripe.api_key = STRIPE_SECRET_KEY
 
 
@@ -133,6 +133,7 @@ def upsert_subscription(
     email = (email or "").strip().lower()
     if not email:
         return
+
     ensure_user(email)
 
     with db() as conn:
@@ -170,8 +171,6 @@ def is_active(user: dict | None) -> bool:
     cpe = int(user.get("current_period_end") or 0)
     now = now_ts()
 
-    # Active/trialing räknas som aktiv.
-    # Om cpe=0 (saknas) => räknas som aktiv, annars måste den ligga i framtiden.
     if status in ("active", "trialing"):
         return True if cpe == 0 else (cpe > now)
 
@@ -232,7 +231,6 @@ def api_status():
     )
 
 
-# Bakåtkompatibilitet om du råkar ha kvar gammal app någonstans:
 @app.get("/api/subscription")
 @require_token
 def api_subscription():
@@ -265,17 +263,21 @@ def api_use_free_quote():
     ensure_user(email)
     user = get_user(email) or {}
 
-    # Har kunden aktiv plan -> ingen begränsning
     if is_active(user):
         return jsonify({"ok": True, "active": True})
 
     free_used = int(user.get("free_quotes_used") or 0)
     if free_used >= 3:
-        # 402 = Payment Required (praktiskt för frontend)
         return jsonify({"error": "free_limit_reached"}), 402
 
     increment_free_quote(email)
-    return jsonify({"ok": True, "free_used": free_used + 1, "free_remaining": max(0, 3 - (free_used + 1))})
+    return jsonify(
+        {
+            "ok": True,
+            "free_used": free_used + 1,
+            "free_remaining": max(0, 3 - (free_used + 1)),
+        }
+    )
 
 
 @app.post("/api/create-checkout-session")
@@ -294,7 +296,6 @@ def create_checkout_session():
     if not STRIPE_SECRET_KEY:
         return jsonify({"error": "STRIPE_SECRET_KEY missing"}), 500
 
-    # säkerställ user
     ensure_user(email)
 
     try:
@@ -310,6 +311,7 @@ def create_checkout_session():
         )
         return jsonify({"url": session.url})
     except Exception as e:
+        print("Checkout session error:", e)
         return jsonify({"error": str(e)}), 500
 
 
@@ -321,12 +323,16 @@ def stripe_webhook():
     payload = request.data
     sig_header = request.headers.get("Stripe-Signature", "")
 
-    # Webhook secret måste finnas i prod. (Om du kör dev kan du sätta en riktig secret i Stripe.)
     if not STRIPE_WEBHOOK_SECRET:
         return "STRIPE_WEBHOOK_SECRET missing", 500
 
     try:
-        event = stripe.Webhook.construct_event(payload, sig_header, STRIPE_WEBHOOK_SECRET)
+        event = stripe.Webhook.construct_event(
+            payload,
+            sig_header,
+            STRIPE_WEBHOOK_SECRET
+        )
+        event = event.to_dict_recursive()
     except Exception as e:
         print("Webhook verify failed:", e)
         return "Bad Request", 400
@@ -335,12 +341,11 @@ def stripe_webhook():
     obj = (event.get("data") or {}).get("object") or {}
 
     def upsert_from_subscription(subscription_id: str, email_hint: str | None = None, customer_id_hint: str | None = None):
-        sub = stripe.Subscription.retrieve(subscription_id)
+        sub = stripe.Subscription.retrieve(subscription_id).to_dict_recursive()
         status = sub.get("status")
         cpe = sub.get("current_period_end")
         customer_id = sub.get("customer") or customer_id_hint
 
-        # price_id från subscription items
         items = (sub.get("items") or {}).get("data") or []
         price_id = None
         if items and isinstance(items, list):
@@ -351,10 +356,9 @@ def stripe_webhook():
 
         plan = plan_from_price(price_id)
 
-        # robust email resolve via customer
         email = None
         if customer_id:
-            cust = stripe.Customer.retrieve(customer_id)
+            cust = stripe.Customer.retrieve(customer_id).to_dict_recursive()
             email = cust.get("email")
 
         email = (email or email_hint or "").strip().lower()
@@ -376,7 +380,11 @@ def stripe_webhook():
             customer_id = obj.get("customer")
 
             if subscription_id:
-                upsert_from_subscription(subscription_id, email_hint=email, customer_id_hint=customer_id)
+                upsert_from_subscription(
+                    subscription_id,
+                    email_hint=email,
+                    customer_id_hint=customer_id,
+                )
 
         elif event_type.startswith("customer.subscription."):
             subscription_id = obj.get("id")
@@ -388,12 +396,16 @@ def stripe_webhook():
             if subscription_id:
                 upsert_from_subscription(subscription_id)
 
-        # Ignorera annat
         return "", 200
 
     except Exception as e:
         print("Webhook error:", e)
         return "Internal Server Error", 500
+
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port)
 
 
 
